@@ -1,0 +1,82 @@
+{
+  "platform": "facebook",
+  "facebook": {
+    "page_id": "",
+    "access_token": ""
+  },
+  "images_folder": "D:\\VSC\\FSB",
+  "selection_mode": "random",
+  "posting_slots": ["08:00", "13:00", "18:00", "21:00"],
+  "max_posts_per_day": 4,
+  "history_file": "D:\\VSC\\social\\state.json",
+  "poll_interval_seconds": 20,
+  "caption_template": "KI-Identitaeten zwischen Realitaet und Illustration.\n\nJede Figur ist einzigartig.\nJede wirkt lebendig.\n\nFolge fuer mehr.",
+  "ai_disclosure": "Dieses Bild wurde mit KI erstellt.\nAehnlichkeiten mit realen Personen sind zufaellig.\n\n#AIArt #AIGenerated #AIModel #DigitalArt #AIgirl #AIGirl\n#ArtificialIntelligence #AIportrait #AIbeauty #DigitalHuman #Hyperrealistic #UnrealReal #SyntheticBeauty #VirtualModel\n#DigitalMuse #FutureAesthetic #AestheticAI #AIinfluencer",
+  "caption_provider": "ollama",
+  "caption_variant_count": 3,
+  "caption_selection_strategy": "random",
+  "supported_extensions": [".jpg", ".jpeg", ".png", ".gif", ".webp"],
+  "delete_after_post": true,
+  "loop": false,
+  "dry_run": false,
+  "ollama": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:11434",
+    "model": "qwen2.5:14b",
+    "temperature": 0.9,
+    "timeout_seconds": 90
+  },
+  "openai": {
+    "enabled": false,
+    "model": "gpt-4.1-mini",
+    "temperature": 0.9,
+    "timeout_seconds": 60,
+    "reel_system_prompt": "Du schreibst virale Kurz-Captions fuer Social-Media-Reels auf Deutsch. Der Text muss schneller, direkter und hook-lastiger sein als bei normalen Bildposts. Die erste Zeile muss sofort Aufmerksamkeit ziehen. Verwende 2 bis 3 kurze Saetze, sprich die Leser direkt mit du an, nutze gelegentlich Emojis wie 👀, 🔥 oder ✨ und ende mit einer klaren Frage oder Call-to-Action. Die letzte Zeile muss exakt der KI-Hinweis sein.",
+    "reel_user_prompt_template": "Erstelle {variant_count} verschiedene Caption-Varianten fuer ein kurzes Multi-Image-Reel.\nAnforderungen:\n- Deutsch\n- 2 bis 3 kurze Saetze\n- Erste Zeile mit starkem Reel-Hook\n- Schneller, dynamischer Stil\n- Fokus auf Kommentare, Shares und Speichern\n- Am Ende eine klare Frage oder ein kurzer Call-to-Action\n- Letzte Zeile exakt: {disclaimer}\n\nReel-Name: {filename}\nReel-Inhalt: {description}\n\nGib ausschliesslich JSON im Format {\"variants\": [\"...\", \"...\", \"...\"]} zurueck."
+  },
+  "reels": {
+    "enabled": true,
+    "simulation_mode": true,
+    "output_folder": "D:\\VSC\\social\\generated_reels",
+    "width": 720,
+    "height": 1280,
+    "fps": 24,
+    "duration_seconds": 10,
+    "images_per_reel": 4,
+    "transition_frames": 10,
+    "transition_style": "hybrid",
+    "zoom_start": 1.0,
+    "zoom_end": 1.12,
+    "text_overlay": true,
+    "hook_text_max_lines": 3,
+    "audio_enabled": true,
+    "audio_volume": 0.22,
+    "outro_enabled": true,
+    "outro_duration_seconds": 2,
+    "brand_title": "AI Muse Feed",
+    "brand_subtitle": "AI-Influencer Reels automatisch erzeugt",
+    "call_to_action": "Folgen, speichern, kommentieren",
+    "anchor_cooldown_reels": 3,
+    "duplicate_window_reels": 12
+  },
+  "music_library": {
+    "enabled": true,
+    "folder": "D:\\VSC\\social\\music",
+    "prefer_local_tracks": true,
+    "auto_match_enabled": true,
+    "require_metadata": true,
+    "require_commercial_use": true,
+    "approved_status": "approved",
+    "allowed_platforms": ["facebook", "instagram", "reels"],
+    "default_tags": ["modern", "social"],
+    "extensions": [".mp3", ".wav", ".m4a", ".aac"]
+  },
+  "watermark": {
+    "enabled": true,
+    "image_path": "D:\\VSC\\social\\assets\\watermark.png",
+    "position": "bottom-right",
+    "width_ratio": 0.18,
+    "opacity": 0.92,
+    "margin_px": 28
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "title": "Mein lizenzierter Track",
+  "artist": "Unbekannt oder eigener Name",
+  "license_status": "approved",
+  "commercial_use": true,
+  "allowed_platforms": ["facebook", "instagram", "reels"],
+  "moods": ["luxury", "romantic"],
+  "genres": ["house", "pop"],
+  "keywords": ["glamour", "night", "fashion"],
+  "energy": "upbeat",
+  "priority": 10,
+  "attribution_required": false,
+  "source_url": "https://dein-lizenznachweis.example",
+  "notes": "Lizenz fuer Social Media und kommerzielle Nutzung geprueft"
+}

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.env
+config.json
+state.json
+
+.poster.lock
+poster.log
+
+generated_reels/
