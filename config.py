@@ -20,17 +20,17 @@ DEFAULT_POSTING_SLOTS = ["08:00", "13:00", "18:00", "21:00"]
 DEFAULT_SUPPORTED_EXTENSIONS = [".jpg", ".jpeg", ".png", ".gif", ".webp"]
 DEFAULT_AI_DISCLOSURE = "Dieses Bild wurde mit KI erstellt.\nÄhnlichkeiten mit realen Personen sind zufällig."
 DEFAULT_SYSTEM_PROMPT = (
-    "Du schreibst virale Social-Media-Captions fuer Facebook und Instagram. "
+    "Du schreibst virale Social-Media-Captions für Facebook und Instagram. "
     "Schreibe auf Deutsch, emotional, direkt und aufmerksamkeitsstark. "
-    "Die erste Zeile braucht einen starken Hook. Verwende 2 bis 4 kurze Saetze, "
+    "Die erste Zeile braucht einen starken Hook. Verwende 2 bis 4 kurze Sätze, "
     "spreche die Leser direkt mit du an, nutze gelegentlich Emojis wie 👀 oder 🔥 "
     "und ende mit einer Frage. Die letzte Zeile muss exakt der KI-Hinweis sein."
 )
 DEFAULT_USER_PROMPT = (
-    "Erstelle {variant_count} verschiedene Caption-Varianten fuer ein KI-generiertes Bild.\n"
+    "Erstelle {variant_count} verschiedene Caption-Varianten für ein KI-generiertes Bild.\n"
     "Anforderungen:\n"
     "- Deutsch\n"
-    "- 2 bis 4 kurze Saetze\n"
+    "- 2 bis 4 kurze Sätze\n"
     "- Erste Zeile mit starkem Hook\n"
     "- Am Ende eine klare Frage\n"
     "- Einfache direkte Sprache\n"
@@ -39,20 +39,20 @@ DEFAULT_USER_PROMPT = (
     "- Letzte Zeile exakt: {disclaimer}\n\n"
     "Bildname: {filename}\n"
     "Bildbeschreibung: {description}\n\n"
-    "Gib ausschliesslich JSON im Format {{\"variants\": [\"...\", \"...\", \"...\"]}} zurueck."
+    "Gib ausschließlich JSON im Format {{\"variants\": [\"...\", \"...\", \"...\"]}} zurück."
 )
 DEFAULT_REEL_SYSTEM_PROMPT = (
-    "Du schreibst virale Kurz-Captions fuer Social-Media-Reels auf Deutsch. "
+    "Du schreibst virale Kurz-Captions für Social-Media-Reels auf Deutsch. "
     "Der Text muss schneller, direkter und hook-lastiger sein als bei normalen Bildposts. "
-    "Die erste Zeile muss sofort Aufmerksamkeit ziehen. Verwende 2 bis 3 kurze Saetze, "
+    "Die erste Zeile muss sofort Aufmerksamkeit ziehen. Verwende 2 bis 3 kurze Sätze, "
     "sprich die Leser direkt mit du an, nutze gelegentlich Emojis wie 👀, 🔥 oder ✨ "
     "und ende mit einer klaren Frage oder Call-to-Action. Die letzte Zeile muss exakt der KI-Hinweis sein."
 )
 DEFAULT_REEL_USER_PROMPT = (
-    "Erstelle {variant_count} verschiedene Caption-Varianten fuer ein kurzes Multi-Image-Reel.\n"
+    "Erstelle {variant_count} verschiedene Caption-Varianten für ein kurzes Multi-Image-Reel.\n"
     "Anforderungen:\n"
     "- Deutsch\n"
-    "- 2 bis 3 kurze Saetze\n"
+    "- 2 bis 3 kurze Sätze\n"
     "- Erste Zeile mit starkem Reel-Hook\n"
     "- Schneller, dynamischer Stil\n"
     "- Fokus auf Kommentare, Shares und Speichern\n"
@@ -60,7 +60,7 @@ DEFAULT_REEL_USER_PROMPT = (
     "- Letzte Zeile exakt: {disclaimer}\n\n"
     "Reel-Name: {filename}\n"
     "Reel-Inhalt: {description}\n\n"
-    "Gib ausschliesslich JSON im Format {{\"variants\": [\"...\", \"...\", \"...\"]}} zurueck."
+    "Gib ausschließlich JSON im Format {{\"variants\": [\"...\", \"...\", \"...\"]}} zurück."
 )
 
 
@@ -90,12 +90,16 @@ class OllamaSettings:
     model: str
     temperature: float
     timeout_seconds: int
+    vision_model: str
+    vision_enabled: bool
+    vision_cache: bool
 
 
 @dataclass(slots=True)
 class ReelSettings:
     enabled: bool
     simulation_mode: bool
+    publish_to_facebook: bool
     output_folder: Path
     width: int
     height: int
@@ -144,6 +148,75 @@ class WatermarkSettings:
 
 
 @dataclass(slots=True)
+class RetrySettings:
+    enabled: bool
+    max_attempts: int
+    delay_seconds: float
+
+
+@dataclass(slots=True)
+class ImageValidationSettings:
+    enabled: bool
+    min_width: int
+    min_height: int
+    max_file_size_mb: float
+
+
+@dataclass(slots=True)
+class HashtagSettings:
+    enabled: bool
+    tags: list[str]
+    count: int
+    strategy: str  # "random", "fixed", "all"
+
+
+@dataclass(slots=True)
+class EngagementTrackingSettings:
+    enabled: bool
+    delay_hours: int
+    low_engagement_threshold: int
+    low_engagement_last_n: int
+
+
+@dataclass(slots=True)
+class SmartSlotsSettings:
+    enabled: bool
+    top_slots_count: int
+    prefer_historical: bool
+    min_data_points: int
+
+
+@dataclass(slots=True)
+class AutoCommentSettings:
+    enabled: bool
+    delay_seconds: int
+    templates: list[str]
+    retroactive: bool
+    retroactive_max_age_days: int
+
+
+@dataclass(slots=True)
+class CaptionScoringSettings:
+    enabled: bool
+    min_score: int
+    max_retries: int
+
+
+@dataclass(slots=True)
+class FollowerTrackingSettings:
+    enabled: bool
+
+
+@dataclass(slots=True)
+class CommentResponseSettings:
+    enabled: bool
+    check_interval_hours: int
+    max_responses_per_post: int
+    lookback_days: int
+    templates: list[str]
+
+
+@dataclass(slots=True)
 class AppConfig:
     platform: str
     images_folder: Path
@@ -156,6 +229,8 @@ class AppConfig:
     selection_mode: str
     dry_run: bool
     delete_after_post: bool
+    loop: bool
+    loop_clear_caption_cache: bool
     poll_interval_seconds: int
     caption_template: str
     ai_disclosure: str
@@ -168,6 +243,15 @@ class AppConfig:
     reels: ReelSettings
     music_library: MusicLibrarySettings
     watermark: WatermarkSettings
+    retry: RetrySettings
+    image_validation: ImageValidationSettings
+    hashtags: HashtagSettings
+    engagement: EngagementTrackingSettings
+    smart_slots: SmartSlotsSettings
+    auto_comment: AutoCommentSettings
+    caption_scoring: CaptionScoringSettings
+    follower_tracking: FollowerTrackingSettings
+    comment_response: CommentResponseSettings
 
 
 def load_settings() -> AppConfig:
@@ -180,6 +264,15 @@ def load_settings() -> AppConfig:
     reels_raw = raw.get("reels", {})
     music_raw = raw.get("music_library", {})
     watermark_raw = raw.get("watermark", {})
+    retry_raw = raw.get("retry", {})
+    validation_raw = raw.get("image_validation", {})
+    hashtags_raw = raw.get("hashtags", {})
+    engagement_raw = raw.get("engagement", {})
+    smart_slots_raw = raw.get("smart_slots", {})
+    auto_comment_raw = raw.get("auto_comment", {})
+    caption_scoring_raw = raw.get("caption_scoring", {})
+    follower_tracking_raw = raw.get("follower_tracking", {})
+    comment_response_raw = raw.get("comment_response", {})
 
     images_folder = Path(_env_or_config("IMAGES_FOLDER", raw, "images_folder", default=str(BASE_DIR / "images")))
     descriptions_raw = _env_or_config("IMAGE_DESCRIPTIONS_FOLDER", raw, "image_descriptions_folder", default="")
@@ -206,6 +299,8 @@ def load_settings() -> AppConfig:
         selection_mode=_env_or_config("SELECTION_MODE", raw, "selection_mode", default="random").lower(),
         dry_run=_read_bool_env("DRY_RUN", raw.get("dry_run", False)),
         delete_after_post=_read_bool_env("DELETE_AFTER_POST", raw.get("delete_after_post", False)),
+        loop=_read_bool_env("LOOP", raw.get("loop", True)),
+        loop_clear_caption_cache=_read_bool_env("LOOP_CLEAR_CAPTION_CACHE", raw.get("loop_clear_caption_cache", True)),
         poll_interval_seconds=int(_env_or_config("POLL_INTERVAL_SECONDS", raw, "poll_interval_seconds", default=20)),
         caption_template=raw.get("caption_template", "").strip(),
         ai_disclosure=ai_disclosure.strip(),
@@ -227,6 +322,9 @@ def load_settings() -> AppConfig:
             model=os.getenv("OLLAMA_MODEL") or ollama_raw.get("model", "qwen2.5:14b"),
             temperature=float(os.getenv("OLLAMA_TEMPERATURE") or ollama_raw.get("temperature", 0.9)),
             timeout_seconds=int(os.getenv("OLLAMA_TIMEOUT_SECONDS") or ollama_raw.get("timeout_seconds", 90)),
+            vision_model=os.getenv("OLLAMA_VISION_MODEL") or ollama_raw.get("vision_model", "llava:13b"),
+            vision_enabled=_read_bool_env("OLLAMA_VISION_ENABLED", ollama_raw.get("vision_enabled", False)),
+            vision_cache=_read_bool_env("OLLAMA_VISION_CACHE", ollama_raw.get("vision_cache", True)),
         ),
         openai=OpenAISettings(
             enabled=_read_bool_env("OPENAI_ENABLED", openai_raw.get("enabled", True)),
@@ -242,6 +340,7 @@ def load_settings() -> AppConfig:
         reels=ReelSettings(
             enabled=_read_bool_env("REELS_ENABLED", reels_raw.get("enabled", True)),
             simulation_mode=_read_bool_env("REELS_SIMULATION_MODE", reels_raw.get("simulation_mode", True)),
+            publish_to_facebook=_read_bool_env("REELS_PUBLISH_TO_FACEBOOK", reels_raw.get("publish_to_facebook", False)),
             output_folder=Path(os.getenv("REELS_OUTPUT_FOLDER") or reels_raw.get("output_folder", str(BASE_DIR / "generated_reels"))),
             width=int(os.getenv("REELS_WIDTH") or reels_raw.get("width", 720)),
             height=int(os.getenv("REELS_HEIGHT") or reels_raw.get("height", 1280)),
@@ -287,9 +386,68 @@ def load_settings() -> AppConfig:
             enabled=_read_bool_env("WATERMARK_ENABLED", watermark_raw.get("enabled", True)),
             image_path=Path(os.getenv("WATERMARK_IMAGE_PATH") or watermark_raw.get("image_path", str(BASE_DIR / "assets" / "watermark.png"))),
             position=(os.getenv("WATERMARK_POSITION") or watermark_raw.get("position", "bottom-right")).lower(),
-            width_ratio=float(os.getenv("WATERMARK_WIDTH_RATIO") or watermark_raw.get("width_ratio", 0.18)),
+            width_ratio=float(os.getenv("WATERMARK_WIDTH_RATIO") or watermark_raw.get("width_ratio", 0.22)),
             opacity=float(os.getenv("WATERMARK_OPACITY") or watermark_raw.get("opacity", 0.92)),
             margin_px=int(os.getenv("WATERMARK_MARGIN_PX") or watermark_raw.get("margin_px", 28)),
+        ),
+        retry=RetrySettings(
+            enabled=_read_bool_env("RETRY_ENABLED", retry_raw.get("enabled", True)),
+            max_attempts=int(os.getenv("RETRY_MAX_ATTEMPTS") or retry_raw.get("max_attempts", 3)),
+            delay_seconds=float(os.getenv("RETRY_DELAY_SECONDS") or retry_raw.get("delay_seconds", 15.0)),
+        ),
+        image_validation=ImageValidationSettings(
+            enabled=_read_bool_env("IMAGE_VALIDATION_ENABLED", validation_raw.get("enabled", True)),
+            min_width=int(os.getenv("IMAGE_VALIDATION_MIN_WIDTH") or validation_raw.get("min_width", 400)),
+            min_height=int(os.getenv("IMAGE_VALIDATION_MIN_HEIGHT") or validation_raw.get("min_height", 400)),
+            max_file_size_mb=float(os.getenv("IMAGE_VALIDATION_MAX_FILE_SIZE_MB") or validation_raw.get("max_file_size_mb", 10.0)),
+        ),
+        hashtags=HashtagSettings(
+            enabled=_read_bool_env("HASHTAGS_ENABLED", hashtags_raw.get("enabled", False)),
+            tags=_read_list_env("HASHTAGS_TAGS") or [str(t) for t in hashtags_raw.get("tags", [])],
+            count=int(os.getenv("HASHTAGS_COUNT") or hashtags_raw.get("count", 5)),
+            strategy=(os.getenv("HASHTAGS_STRATEGY") or hashtags_raw.get("strategy", "random")).lower(),
+        ),
+        engagement=EngagementTrackingSettings(
+            enabled=_read_bool_env("ENGAGEMENT_ENABLED", engagement_raw.get("enabled", False)),
+            delay_hours=int(os.getenv("ENGAGEMENT_DELAY_HOURS") or engagement_raw.get("delay_hours", 24)),
+            low_engagement_threshold=int(os.getenv("ENGAGEMENT_LOW_THRESHOLD") or engagement_raw.get("low_engagement_threshold", 5)),
+            low_engagement_last_n=int(os.getenv("ENGAGEMENT_LOW_LAST_N") or engagement_raw.get("low_engagement_last_n", 5)),
+        ),
+        smart_slots=SmartSlotsSettings(
+            enabled=_read_bool_env("SMART_SLOTS_ENABLED", smart_slots_raw.get("enabled", False)),
+            top_slots_count=int(os.getenv("SMART_SLOTS_TOP_COUNT") or smart_slots_raw.get("top_slots_count", 4)),
+            prefer_historical=_read_bool_env("SMART_SLOTS_PREFER_HISTORICAL", smart_slots_raw.get("prefer_historical", True)),
+            min_data_points=int(os.getenv("SMART_SLOTS_MIN_DATA_POINTS") or smart_slots_raw.get("min_data_points", 20)),
+        ),
+        auto_comment=AutoCommentSettings(
+            enabled=_read_bool_env("AUTO_COMMENT_ENABLED", auto_comment_raw.get("enabled", False)),
+            delay_seconds=int(os.getenv("AUTO_COMMENT_DELAY_SECONDS") or auto_comment_raw.get("delay_seconds", 60)),
+            templates=_read_list_env("AUTO_COMMENT_TEMPLATES") or [str(t) for t in auto_comment_raw.get("templates", [
+                "Was denkst du? Folge uns für mehr KI-Kunst! 👀",
+                "Echt oder KI? Schreib es uns in die Kommentare! 🔥",
+                "Welches Detail fällt dir als erstes auf? ✨",
+            ])],
+            retroactive=_read_bool_env("AUTO_COMMENT_RETROACTIVE", auto_comment_raw.get("retroactive", False)),
+            retroactive_max_age_days=int(os.getenv("AUTO_COMMENT_RETROACTIVE_MAX_AGE_DAYS") or auto_comment_raw.get("retroactive_max_age_days", 30)),
+        ),
+        caption_scoring=CaptionScoringSettings(
+            enabled=_read_bool_env("CAPTION_SCORING_ENABLED", caption_scoring_raw.get("enabled", True)),
+            min_score=int(os.getenv("CAPTION_SCORING_MIN_SCORE") or caption_scoring_raw.get("min_score", 55)),
+            max_retries=int(os.getenv("CAPTION_SCORING_MAX_RETRIES") or caption_scoring_raw.get("max_retries", 2)),
+        ),
+        follower_tracking=FollowerTrackingSettings(
+            enabled=_read_bool_env("FOLLOWER_TRACKING_ENABLED", follower_tracking_raw.get("enabled", False)),
+        ),
+        comment_response=CommentResponseSettings(
+            enabled=_read_bool_env("COMMENT_RESPONSE_ENABLED", comment_response_raw.get("enabled", False)),
+            check_interval_hours=int(os.getenv("COMMENT_RESPONSE_CHECK_INTERVAL") or comment_response_raw.get("check_interval_hours", 6)),
+            max_responses_per_post=int(os.getenv("COMMENT_RESPONSE_MAX_PER_POST") or comment_response_raw.get("max_responses_per_post", 3)),
+            lookback_days=int(os.getenv("COMMENT_RESPONSE_LOOKBACK_DAYS") or comment_response_raw.get("lookback_days", 3)),
+            templates=_read_list_env("COMMENT_RESPONSE_TEMPLATES") or [str(t) for t in comment_response_raw.get("templates", [
+                "Danke! 🙏 Was ist dein Lieblingsdetail?",
+                "Schön dass du fragst! Folge uns für mehr 👀",
+                "Freut uns sehr! Was gefällt dir am besten? ✨",
+            ])],
         ),
     )
 

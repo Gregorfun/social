@@ -241,7 +241,7 @@ class ReelGenerator:
         draw = ImageDraw.Draw(frame_rgba, "RGBA")
         width, height = frame.size
 
-        gradient_height = int(height * 0.42)
+        gradient_height = int(height * 0.46)
         overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay, "RGBA")
         for index in range(gradient_height):
@@ -250,16 +250,25 @@ class ReelGenerator:
             overlay_draw.rectangle((0, y, width, y + 1), fill=(8, 10, 20, alpha))
         frame_rgba.alpha_composite(overlay)
 
-        title_font = self._load_font(54)
-        body_font = self._load_font(34)
-        text_x = 52
-        current_y = height - gradient_height + 96
+        title_size = max(34, int(width * 0.043))
+        body_size = max(24, int(width * 0.029))
+        text_x = int(width * 0.06)
+        text_max_width = width - (text_x * 2)
+        current_y = height - gradient_height + int(height * 0.075)
 
         for index, line in enumerate(overlay_lines):
-            font = title_font if index == 0 else body_font
-            draw.text((text_x, current_y), line, font=font, fill=(255, 255, 255, 242))
-            bbox = draw.textbbox((text_x, current_y), line, font=font)
-            current_y = bbox[3] + 18
+            font = self._fit_overlay_font(draw, line, title_size if index == 0 else body_size, text_max_width)
+            stroke_width = 3 if index == 0 else 2
+            draw.text(
+                (text_x, current_y),
+                line,
+                font=font,
+                fill=(255, 255, 255, 244),
+                stroke_width=stroke_width,
+                stroke_fill=(4, 8, 18, 210),
+            )
+            bbox = draw.textbbox((text_x, current_y), line, font=font, stroke_width=stroke_width)
+            current_y = bbox[3] + (18 if index == 0 else 14)
 
         if frame.mode != "RGBA":
             frame.paste(frame_rgba.convert("RGB"))
@@ -281,13 +290,60 @@ class ReelGenerator:
         if not relevant_lines:
             relevant_lines = ["AI oder echt?", "Was zieht dich hier sofort an?"]
 
-        wrapped: list[str] = []
+        max_lines = max(2, int(self.config.reels.hook_text_max_lines or 3))
+        segments: list[str] = []
         for line in relevant_lines:
-            wrapped.extend(textwrap.wrap(line, width=24) or [line])
-            if len(wrapped) >= self.config.reels.hook_text_max_lines:
-                break
+            pieces = [piece.strip(" -–—") for piece in re.split(r"(?<=[.!?])\s+", line) if piece.strip()]
+            segments.extend(pieces or [line])
 
-        return wrapped[: self.config.reels.hook_text_max_lines]
+        headline = segments[0] if segments else relevant_lines[0]
+        supporting = segments[1:] if len(segments) > 1 else relevant_lines[1:]
+
+        wrapped: list[str] = []
+        wrapped.extend(self._wrap_overlay_segment(headline, width=28, limit=min(2, max_lines)))
+        remaining = max_lines - len(wrapped)
+        for segment in supporting:
+            if remaining <= 0:
+                break
+            lines = self._wrap_overlay_segment(segment, width=32, limit=remaining)
+            wrapped.extend(lines)
+            remaining = max_lines - len(wrapped)
+
+        return wrapped[:max_lines]
+
+    def _wrap_overlay_segment(self, text: str, width: int, limit: int) -> list[str]:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized or limit <= 0:
+            return []
+
+        wrapped = textwrap.wrap(
+            normalized,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [normalized]
+        if len(wrapped) <= limit:
+            return wrapped
+
+        clipped = wrapped[:limit]
+        clipped[-1] = textwrap.shorten(" ".join(wrapped[limit - 1:]), width=max(width - 1, 8), placeholder="...")
+        return clipped
+
+    def _fit_overlay_font(
+        self,
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        preferred_size: int,
+        max_width: int,
+    ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        size = preferred_size
+        while size > 20:
+            font = self._load_font(size)
+            bbox = draw.textbbox((0, 0), text, font=font, stroke_width=2)
+            if (bbox[2] - bbox[0]) <= max_width:
+                return font
+            size -= 2
+        return self._load_font(20)
 
     def _resize_cover(self, image: Image.Image, width: int, height: int) -> Image.Image:
         ratio = max(width / image.width, height / image.height)

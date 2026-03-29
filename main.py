@@ -3,6 +3,8 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import random
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +31,27 @@ class AutoPostingService:
         self.caption_generator = CaptionGenerator(config)
         self.facebook_poster = FacebookPoster(config)
         self.reel_generator = ReelGenerator(config)
+        self._comment_api_unavailable_reason: str | None = None
+
+    def _disable_comment_features(self, state: dict | None, post_ids: list[str], reason: str | None):
+        resolved_reason = reason or "Facebook-Kommentare sind fuer dieses Token derzeit nicht verfuegbar."
+        if self._comment_api_unavailable_reason == resolved_reason:
+            return
+
+        self._comment_api_unavailable_reason = resolved_reason
+        log.warning("Facebook-Kommentare deaktiviert: %s", resolved_reason)
+
+        if state is None:
+            return
+
+        changed = False
+        for post_id in post_ids:
+            if not post_id:
+                continue
+            self.history.mark_auto_comment_blocked(state, post_id, resolved_reason)
+            changed = True
+        if changed:
+            self.history.save(state)
 
     def _simulate_reel_publish(self, reel_path: Path, slot: str, source_images: list[str]) -> tuple[str, str]:
         if self.config.reels.simulation_mode:
@@ -37,6 +60,26 @@ class AutoPostingService:
                 f"Reel-Testlauf fuer Slot {slot}: {reel_path.name} mit {len(source_images)} Bildern simuliert, kein externer Upload.",
             )
         return ("created", "Reel erzeugt und lokal gespeichert. Kein externer Upload konfiguriert.")
+
+    def _publish_reel(self, reel_path: Path, slot: str, source_images: list[str], caption: str) -> tuple[str, str, str | None]:
+        if self.config.reels.simulation_mode:
+            return (
+                "simulated",
+                f"Reel-Testlauf fuer Slot {slot}: {reel_path.name} mit {len(source_images)} Bildern simuliert, kein externer Upload.",
+                None,
+            )
+
+        if self.config.platform != "facebook" or not self.config.reels.publish_to_facebook:
+            return ("created", "Reel erzeugt und lokal gespeichert. Facebook-Reel-Upload ist deaktiviert.", None)
+
+        result = self.facebook_poster.post_reel(reel_path, caption)
+        if result.success:
+            return ("published", f"Facebook-Reel veroeffentlicht (Reel-ID: {result.reel_id}).", result.reel_id)
+        return (
+            "failed",
+            f"Facebook-Reel-Upload fehlgeschlagen: {result.error or 'Unbekannter Fehler'}",
+            result.reel_id,
+        )
 
     def _get_reel_control(self, state: dict) -> dict:
         control = state.setdefault("reel_control", {})
@@ -61,7 +104,7 @@ class AutoPostingService:
         control["planned_caption_source"] = None
         control["planned_caption_updated_at"] = None
 
-    def _build_reel_caption(self, state: dict, control: dict, reel_images: list[Path], fallback_caption: str) -> tuple[str, str]:
+    def _build_reel_caption(self, state: dict, control: dict, reel_images: list[Path], fallback_caption: str, feature_weights: dict | None = None) -> tuple[str, str]:
         caption_override = str(control.get("caption_override") or "").strip()
         if caption_override:
             return caption_override, "manual"
@@ -73,7 +116,7 @@ class AutoPostingService:
             return cached_caption, str(control.get("planned_caption_source") or "cached")
 
         try:
-            bundle = self.caption_generator.generate_for_reel(reel_images)
+            bundle = self.caption_generator.generate_for_reel(reel_images, feature_weights=feature_weights)
             control["planned_caption"] = bundle.selected
             control["planned_caption_source"] = bundle.source
             control["planned_caption_updated_at"] = datetime.now().isoformat()
@@ -131,6 +174,21 @@ class AutoPostingService:
 
         images = self._list_available_images()
         self.history.sync_image_registry(state, images)
+        feature_weights = self.history.compute_caption_feature_weights(state)
+        if feature_weights:
+            log.info("Caption-Lerngewichte aktiv: %s", {k: f"{v:.2f}" for k, v in feature_weights.items()})
+
+        if self.config.engagement.enabled:
+            trend = self.history.get_recent_engagement_trend(state, self.config.engagement.low_engagement_last_n)
+            if trend is not None:
+                threshold = self.config.engagement.low_engagement_threshold
+                if trend < threshold:
+                    log.warning(
+                        "Niedriges Engagement erkannt: Durchschnitt %.1f (letzte %d Posts, Schwellenwert: %.1f).",
+                        trend, self.config.engagement.low_engagement_last_n, threshold,
+                    )
+                else:
+                    log.info("Engagement-Trend: Durchschnitt %.1f (letzte %d Posts mit Daten).", trend, self.config.engagement.low_engagement_last_n)
 
         if not images:
             log.warning("Keine Bilder verfuegbar. Slot %s wird uebersprungen.", slot)
@@ -141,6 +199,12 @@ class AutoPostingService:
 
         image = self.history.choose_next_image(state, images, self.config.selection_mode)
         if image is None:
+            if self.config.loop and images:
+                log.info("Alle Bilder wurden gepostet – Posting-Zyklus wird zurueckgesetzt.")
+                self.history.reset_cycle(state, images, self.config.selection_mode)
+                image = self.history.choose_next_image(state, images, self.config.selection_mode)
+
+        if image is None:
             log.info("Keine unverwendeten Bilder mehr verfuegbar. Slot %s wird uebersprungen.", slot)
             self.history.update_next_image(state, images, self.config.selection_mode)
             self.history.mark_slot_run(state, day_key, slot, status="skipped", message="Keine unverwendeten Bilder verfuegbar.")
@@ -150,7 +214,7 @@ class AutoPostingService:
         log.info("Gewaehlter Slot: %s", slot)
         log.info("Gewaehltes Bild: %s", image.name)
 
-        caption_bundle = self.caption_generator.generate_for_image(image)
+        caption_bundle = self.caption_generator.generate_for_image(image, feature_weights=feature_weights)
         self.history.store_generated_captions(
             state,
             image_name=image.name,
@@ -166,12 +230,13 @@ class AutoPostingService:
                 control = self._get_reel_control(state)
                 reel_images = self._build_reel_plan(state, images, image)
                 if reel_images:
-                    reel_caption, reel_caption_source = self._build_reel_caption(state, control, reel_images, caption_bundle.selected)
+                    reel_caption, reel_caption_source = self._build_reel_caption(state, control, reel_images, caption_bundle.selected, feature_weights=feature_weights)
                     reel_result = self.reel_generator.generate_reel(reel_images, reel_caption)
-                    reel_publish_status, reel_publish_message = self._simulate_reel_publish(
+                    reel_publish_status, reel_publish_message, reel_post_id = self._publish_reel(
                         reel_result.output_path,
                         slot,
                         reel_result.source_images,
+                        reel_caption,
                     )
                     self.history.store_generated_reel(
                         state,
@@ -187,6 +252,7 @@ class AutoPostingService:
                         simulation_mode=self.config.reels.simulation_mode,
                         publish_status=reel_publish_status,
                         publish_message=reel_publish_message,
+                        published_post_id=reel_post_id,
                     )
                     log.info(
                         "Reel erzeugt: %s | Quellen: %s | Audio: %s%s | Status: %s",
@@ -229,6 +295,7 @@ class AutoPostingService:
             images_after_post = [current for current in images if current.name != image.name]
             log.info("Bild verschoben nach 'versendet': %s", moved_path.name)
 
+        self._track_follower_count(state)
         self.history.record_post_success(
             state,
             image=image,
@@ -240,12 +307,147 @@ class AutoPostingService:
         )
         self.history.save(state)
 
+        if result.post_id and result.post_id != "dry-run":
+            self._post_auto_comment(result.post_id, state=state)
+
     def prepare_runtime_state(self):
         state = self.history.load()
         images = self._list_available_images()
         self.history.sync_image_registry(state, images)
         self.history.update_next_image(state, images, self.config.selection_mode)
         self.history.save(state)
+
+    def check_pending_engagement(self):
+        if not self.config.engagement.enabled:
+            return
+        state = self.history.load()
+        pending = self.history.get_posts_needing_engagement_check(state, self.config.engagement.delay_hours)
+        if not pending:
+            return
+        log.info("Pruefe Engagement fuer %d ausstehende Posts ...", len(pending))
+        changed = False
+        for entry in pending:
+            post_id = entry["post_id"]
+            engagement = self.facebook_poster.fetch_engagement(post_id)
+            if engagement:
+                self.history.store_engagement(state, post_id, engagement)
+                likes = (engagement.get("likes") or {}).get("summary", {}).get("total_count", 0)
+                comments = (engagement.get("comments") or {}).get("summary", {}).get("total_count", 0)
+                shares = (engagement.get("shares") or {}).get("count", 0)
+                log.info("Engagement Post %s: %d Likes, %d Kommentare, %d Shares", post_id, likes, comments, shares)
+                changed = True
+        if changed:
+            self.history.save(state)
+
+    def _post_auto_comment(self, post_id: str, state: dict | None = None):
+        cfg = self.config.auto_comment
+        if not cfg.enabled or not cfg.templates or self._comment_api_unavailable_reason:
+            return
+        if cfg.delay_seconds > 0:
+            time.sleep(cfg.delay_seconds)
+        text = random.choice(cfg.templates)
+        result = self.facebook_poster.post_comment(post_id, text)
+        if result.success:
+            log.info("Auto-Kommentar gepostet unter Post %s", post_id)
+            if state is not None:
+                self.history.mark_auto_commented(state, post_id)
+                self.history.save(state)
+        elif result.permanent:
+            self._disable_comment_features(state, [post_id], result.error)
+        else:
+            log.warning("Auto-Kommentar fehlgeschlagen fuer Post %s: %s", post_id, result.error or "Unbekannter Fehler")
+
+    def check_and_comment_old_posts(self):
+        cfg = self.config.auto_comment
+        if not cfg.enabled or not cfg.retroactive or not cfg.templates or self._comment_api_unavailable_reason:
+            return
+        state = self.history.load()
+        pending = self.history.get_posts_needing_auto_comment(state, cfg.retroactive_max_age_days)
+        if not pending:
+            return
+        log.info("Retroaktive Kommentierung: %d Posts ohne Auto-Kommentar gefunden.", len(pending))
+        for index, entry in enumerate(pending):
+            post_id = entry["post_id"]
+            text = random.choice(cfg.templates)
+            result = self.facebook_poster.post_comment(post_id, text)
+            if result.success:
+                log.info("Retroaktiver Kommentar gepostet unter Post %s (%s)", post_id, entry.get("file", ""))
+                self.history.mark_auto_commented(state, post_id)
+                self.history.save(state)
+            elif result.permanent:
+                remaining_post_ids = [
+                    str(candidate.get("post_id") or "")
+                    for candidate in pending[index:]
+                ]
+                self._disable_comment_features(state, remaining_post_ids, result.error)
+                return
+            else:
+                log.warning("Retroaktiver Kommentar fehlgeschlagen fuer Post %s: %s", post_id, result.error or "Unbekannter Fehler")
+
+    def _track_follower_count(self, state: dict):
+        if not self.config.follower_tracking.enabled:
+            return
+        count = self.facebook_poster.fetch_follower_count()
+        if count is not None:
+            self.history.record_follower_count(state, count)
+            growth = self.history.get_weekly_growth(state)
+            if growth is not None:
+                log.info("Follower: %d (Wachstum letzte 7 Tage: %+.0f)", count, growth)
+            else:
+                log.info("Follower: %d", count)
+
+    def check_and_respond_to_comments(self):
+        if not self.config.comment_response.enabled or self._comment_api_unavailable_reason:
+            return
+        cfg = self.config.comment_response
+        state = self.history.load()
+        posts = self.history.get_posts_for_comment_response(state, cfg.lookback_days)
+        if not posts:
+            return
+        log.info("Pruefe Kommentare auf %d Posts ...", len(posts))
+        changed = False
+        for entry in posts:
+            post_id = entry["post_id"]
+            replied_ids = self.history.get_replied_comment_ids(state, post_id)
+            comments = self.facebook_poster.fetch_unanswered_comments(
+                post_id, replied_ids, cfg.max_responses_per_post
+            )
+            for comment in comments:
+                comment_id = comment["id"]
+                text = random.choice(cfg.templates)
+                result = self.facebook_poster.reply_to_comment(comment_id, text)
+                if result.success:
+                    self.history.mark_comment_replied(state, post_id, comment_id)
+                    log.info("Auf Kommentar %s geantwortet", comment_id)
+                    changed = True
+                elif result.permanent:
+                    self._disable_comment_features(None, [], result.error)
+                    return
+                else:
+                    log.warning("Kommentar-Antwort fehlgeschlagen fuer Kommentar %s: %s", comment_id, result.error or "Unbekannter Fehler")
+        if changed:
+            self.history.save(state)
+
+    def apply_smart_slots(self) -> list[str]:
+        if not self.config.smart_slots.enabled:
+            return self.config.posting_slots
+        cfg = self.config.smart_slots
+
+        if cfg.prefer_historical:
+            state = self.history.load()
+            historical_slots = self.history.compute_best_slots(state, cfg.top_slots_count, cfg.min_data_points)
+            if historical_slots:
+                log.info("Historisch optimale Posting-Slots: %s", ", ".join(historical_slots))
+                return historical_slots
+
+        log.info("Lade beste Posting-Zeiten von Facebook Insights ...")
+        api_slots = self.facebook_poster.fetch_best_posting_slots(cfg.top_slots_count)
+        if api_slots:
+            log.info("API-optimale Posting-Slots ermittelt: %s", ", ".join(api_slots))
+            return api_slots
+
+        log.warning("Slot-Optimierung fehlgeschlagen, verwende konfigurierte Slots.")
+        return self.config.posting_slots
 
     def _list_available_images(self) -> list[Path]:
         if not self.config.images_folder.exists():
@@ -310,17 +512,33 @@ def main():
 
     service = AutoPostingService(config)
     service.prepare_runtime_state()
+    service.check_pending_engagement()
+    service.check_and_respond_to_comments()
+    service.check_and_comment_old_posts()
+    active_slots = service.apply_smart_slots()
 
     log.info("=" * 60)
     log.info("AI-Influencer Auto-Poster gestartet")
     log.info("  Ordner        : %s", config.images_folder)
-    log.info("  Slots         : %s", ", ".join(config.posting_slots))
+    log.info("  Slots         : %s", ", ".join(active_slots))
     log.info("  Max/Tag       : %s", config.max_posts_per_day)
     log.info("  Auswahl       : %s", config.selection_mode)
     log.info("  Caption       : %s", config.caption_provider)
     log.info("  Ollama Modell : %s", config.ollama.model)
+    log.info("  Vision-Modell : %s", config.ollama.vision_model if config.ollama.vision_enabled else "deaktiviert")
+    log.info("  Vision-Cache  : %s", config.ollama.vision_cache)
     log.info("  OpenAI Fallback: %s", config.openai.enabled)
+    log.info("  Caption-Score : %s (min %d, max %dx Retry)", config.caption_scoring.enabled, config.caption_scoring.min_score, config.caption_scoring.max_retries)
+    log.info("  Auto-Kommentar: %s (Delay %ds)", config.auto_comment.enabled, config.auto_comment.delay_seconds)
+    log.info("  Follower-Track: %s", config.follower_tracking.enabled)
+    log.info("  Comment-Reply : %s (%d Tage Lookback)", config.comment_response.enabled, config.comment_response.lookback_days)
+    log.info("  Hashtags      : %s", config.hashtags.enabled)
+    log.info("  Retry         : %s (max %dx, %.0fs Delay)", config.retry.enabled, config.retry.max_attempts, config.retry.delay_seconds)
+    log.info("  Validierung   : %s (min %dx%d, max %.0fMB)", config.image_validation.enabled, config.image_validation.min_width, config.image_validation.min_height, config.image_validation.max_file_size_mb)
+    log.info("  Engagement    : %s (nach %dh)", config.engagement.enabled, config.engagement.delay_hours)
+    log.info("  Smart Slots   : %s", config.smart_slots.enabled)
     log.info("  Reels aktiv   : %s", config.reels.enabled)
+    log.info("  Reel-Upload FB: %s", config.reels.publish_to_facebook)
     log.info("  Reel-Ausgabe  : %s", config.reels.output_folder)
     log.info("  Reel-Simulation: %s", config.reels.simulation_mode)
     log.info("  Reel-Bilder   : %s", config.reels.images_per_reel)
@@ -333,7 +551,7 @@ def main():
     log.info("=" * 60)
 
     scheduler = DailySlotScheduler(
-        posting_slots=config.posting_slots,
+        posting_slots=active_slots,
         callback=service.process_slot,
         poll_interval_seconds=config.poll_interval_seconds,
     )

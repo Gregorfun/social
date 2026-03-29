@@ -3,9 +3,16 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import logging
+import re
+
+from caption_generator import extract_caption_features
+
+log = logging.getLogger(__name__)
 
 
 def default_state() -> dict[str, Any]:
@@ -19,6 +26,8 @@ def default_state() -> dict[str, Any]:
         "captions": {},
         "slot_runs": {},
         "generated_reels": [],
+        "follower_history": [],
+        "comment_response_log": {},
         "reel_control": {
             "queue_override": [],
             "caption_override": "",
@@ -53,6 +62,8 @@ class PostHistory:
         normalized.setdefault("slot_runs", {})
         normalized.setdefault("posted", [])
         normalized.setdefault("generated_reels", [])
+        normalized.setdefault("follower_history", [])
+        normalized.setdefault("comment_response_log", {})
         normalized.setdefault(
             "reel_control",
             {
@@ -379,6 +390,7 @@ class PostHistory:
         simulation_mode: bool,
         publish_status: str,
         publish_message: str,
+        published_post_id: str | None = None,
     ):
         state.setdefault("generated_reels", []).append(
             {
@@ -394,6 +406,7 @@ class PostHistory:
                 "simulation_mode": simulation_mode,
                 "publish_status": publish_status,
                 "publish_message": publish_message,
+                "published_post_id": published_post_id,
                 "time": datetime.now().isoformat(),
             }
         )
@@ -417,6 +430,266 @@ class PostHistory:
             "post_id": post_id,
             "time": datetime.now().isoformat(),
         }
+
+    def record_follower_count(self, state: dict[str, Any], count: int):
+        state.setdefault("follower_history", []).append({
+            "count": count,
+            "time": datetime.now().isoformat(),
+        })
+
+    def get_weekly_growth(self, state: dict[str, Any]) -> float | None:
+        history = state.get("follower_history", [])
+        if len(history) < 2:
+            return None
+        latest = history[-1]
+        cutoff = datetime.now() - timedelta(days=7)
+        baseline = next(
+            (entry for entry in reversed(history[:-1]) if datetime.fromisoformat(entry["time"]) <= cutoff),
+            history[0],
+        )
+        return float(latest["count"] - baseline["count"])
+
+    def compute_caption_feature_weights(self, state: dict[str, Any]) -> dict[str, float]:
+        posts = [
+            entry for entry in state.get("posted", [])
+            if entry.get("engagement") and entry.get("caption")
+        ]
+        if len(posts) < 3:
+            return {}
+
+        # Confidence scaling: weights closer to 1.0 with fewer data points
+        confidence = min(len(posts) / 10.0, 1.0)
+
+        feature_names = ["starts_with_question", "starts_with_exclamation", "has_emoji_hook", "ends_with_question", "optimal_length"]
+        buckets: dict[str, dict[str, list[int]]] = {f: {"with": [], "without": []} for f in feature_names}
+
+        for entry in posts:
+            caption = entry["caption"]
+            eng = entry["engagement"]
+            eng_score = eng.get("likes", 0) + eng.get("comments", 0) * 2 + eng.get("shares", 0) * 3
+            features = extract_caption_features(caption)
+            for f in feature_names:
+                if features.get(f):
+                    buckets[f]["with"].append(eng_score)
+                else:
+                    buckets[f]["without"].append(eng_score)
+
+        weights: dict[str, float] = {}
+        for f, data in buckets.items():
+            if data["with"] and data["without"]:
+                avg_with = sum(data["with"]) / len(data["with"])
+                avg_without = sum(data["without"]) / len(data["without"])
+                if avg_without > 0:
+                    raw_weight = avg_with / avg_without
+                    # Scale toward 1.0 based on confidence (fewer data → closer to neutral)
+                    weights[f] = round(1.0 + (raw_weight - 1.0) * confidence, 3)
+        return weights
+
+    @staticmethod
+    def compute_image_score(entry: dict[str, Any]) -> int:
+        """Calculates engagement score for a single post entry."""
+        eng = entry.get("engagement") or {}
+        return eng.get("likes", 0) + eng.get("comments", 0) * 3 + eng.get("shares", 0) * 5
+
+    def compute_hashtag_performance(self, state: dict[str, Any]) -> dict[str, dict]:
+        """Returns per-hashtag engagement stats for posts that have engagement data."""
+        hashtag_data: dict[str, list[int]] = {}
+        for entry in state.get("posted", []):
+            if not entry.get("engagement"):
+                continue
+            caption = entry.get("caption", "") or ""
+            score = self.compute_image_score(entry)
+            for tag in re.findall(r"#\w+", caption):
+                hashtag_data.setdefault(tag.lower(), []).append(score)
+        return {
+            tag: {
+                "posts": len(scores),
+                "avg_score": round(sum(scores) / len(scores), 1),
+                "total_score": sum(scores),
+            }
+            for tag, scores in hashtag_data.items()
+        }
+
+    def compute_weekday_performance(self, state: dict[str, Any]) -> dict[str, float]:
+        """Returns average engagement score per weekday+hour slot."""
+        WEEKDAY_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+        weekday_data: dict[str, list[int]] = {}
+        for entry in state.get("posted", []):
+            if not entry.get("engagement"):
+                continue
+            time_str = entry.get("time", "")
+            if not time_str:
+                continue
+            try:
+                dt = datetime.fromisoformat(time_str)
+            except ValueError:
+                continue
+            key = f"{WEEKDAY_DE[dt.weekday()]}_{dt.strftime('%H:00')}"
+            weekday_data.setdefault(key, []).append(self.compute_image_score(entry))
+        return {
+            key: round(sum(scores) / len(scores), 1)
+            for key, scores in weekday_data.items()
+        }
+
+    def get_recent_engagement_trend(self, state: dict[str, Any], last_n: int = 5) -> float | None:
+        """Returns average engagement score of the last N posts with engagement data."""
+        posts_with_data = [e for e in state.get("posted", []) if e.get("engagement")]
+        if not posts_with_data:
+            return None
+        recent = posts_with_data[-last_n:]
+        scores = [self.compute_image_score(e) for e in recent]
+        return round(sum(scores) / len(scores), 1)
+
+    def clear_caption_cache(self, state: dict[str, Any]):
+        """Clears all cached captions to force fresh generation in the next cycle."""
+        count = len(state.get("captions", {}))
+        state["captions"] = {}
+        log.info("Caption-Cache geleert: %d Eintraege entfernt.", count)
+
+    def reset_cycle(self, state: dict[str, Any], images: list[Path], selection_mode: str):
+        """Resets the posting cycle: marks all images as unposted, clears caption cache."""
+        registry = state.setdefault("image_registry", {})
+        reset_count = 0
+        for name in registry:
+            if registry[name].get("posted"):
+                registry[name]["posted"] = False
+                registry[name]["posted_at"] = None
+                reset_count += 1
+        state["cycle_posted"] = []
+        self.clear_caption_cache(state)
+        self.update_next_image(state, images, selection_mode)
+        log.info("Posting-Zyklus zurueckgesetzt: %d Bilder freigegeben.", reset_count)
+
+    def compute_best_slots(self, state: dict[str, Any], top_count: int, min_data_points: int = 5) -> list[str]:
+        slot_data: dict[str, list[int]] = {}
+        for entry in state.get("posted", []):
+            slot = entry.get("slot")
+            eng = entry.get("engagement")
+            if not slot or not eng:
+                continue
+            score = eng.get("likes", 0) + eng.get("comments", 0) * 2 + eng.get("shares", 0) * 3
+            slot_data.setdefault(slot, []).append(score)
+
+        threshold = max(2, min_data_points // 3)
+        avg_by_slot = {
+            slot: sum(scores) / len(scores)
+            for slot, scores in slot_data.items()
+            if len(scores) >= threshold
+        }
+        if not avg_by_slot or max(len(v) for v in slot_data.values()) < min_data_points:
+            return []
+
+        sorted_slots = sorted(avg_by_slot, key=lambda s: avg_by_slot[s], reverse=True)
+        return sorted(sorted_slots[:top_count])
+
+    def mark_auto_commented(self, state: dict[str, Any], post_id: str):
+        for entry in state.get("posted", []):
+            if entry.get("post_id") == post_id:
+                entry["auto_commented"] = True
+                entry.pop("auto_comment_blocked", None)
+                entry.pop("auto_comment_error", None)
+                entry.pop("auto_comment_blocked_at", None)
+                break
+
+    def mark_auto_comment_blocked(self, state: dict[str, Any], post_id: str, reason: str):
+        for entry in state.get("posted", []):
+            if entry.get("post_id") == post_id:
+                entry["auto_comment_blocked"] = True
+                entry["auto_comment_error"] = reason
+                entry["auto_comment_blocked_at"] = datetime.now().isoformat()
+                break
+
+    def get_posts_needing_auto_comment(self, state: dict[str, Any], max_age_days: int) -> list[dict]:
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        result = []
+        for entry in state.get("posted", []):
+            post_id = entry.get("post_id", "")
+            if not post_id or post_id == "dry-run":
+                continue
+            if entry.get("auto_commented"):
+                continue
+            if entry.get("auto_comment_blocked"):
+                continue
+            posted_at_str = entry.get("time", "")
+            if not posted_at_str:
+                continue
+            try:
+                if datetime.fromisoformat(posted_at_str) < cutoff:
+                    continue
+            except ValueError:
+                continue
+            result.append(entry)
+        return result
+
+    def get_posts_for_comment_response(self, state: dict[str, Any], lookback_days: int) -> list[dict]:
+        cutoff = datetime.now() - timedelta(days=lookback_days)
+        result = []
+        for entry in state.get("posted", []):
+            post_id = entry.get("post_id", "")
+            if not post_id or post_id == "dry-run":
+                continue
+            posted_at_str = entry.get("time", "")
+            if not posted_at_str:
+                continue
+            try:
+                if datetime.fromisoformat(posted_at_str) < cutoff:
+                    continue
+            except ValueError:
+                continue
+            result.append(entry)
+        return result
+
+    def mark_comment_replied(self, state: dict[str, Any], post_id: str, comment_id: str):
+        log_entry = state.setdefault("comment_response_log", {}).setdefault(post_id, {
+            "replied_comment_ids": [],
+            "last_checked_at": None,
+        })
+        if comment_id not in log_entry["replied_comment_ids"]:
+            log_entry["replied_comment_ids"].append(comment_id)
+        log_entry["last_checked_at"] = datetime.now().isoformat()
+
+    def get_replied_comment_ids(self, state: dict[str, Any], post_id: str) -> set[str]:
+        log_entry = state.get("comment_response_log", {}).get(post_id, {})
+        return set(log_entry.get("replied_comment_ids", []))
+
+    def get_posts_needing_engagement_check(self, state: dict, delay_hours: int) -> list[dict]:
+        now = datetime.now()
+        pending = []
+        for entry in state.get("posted", []):
+            post_id = entry.get("post_id", "")
+            if not post_id or post_id == "dry-run":
+                continue
+            if entry.get("engagement_checked_at"):
+                continue
+            posted_at_str = entry.get("time", "")
+            if not posted_at_str:
+                continue
+            try:
+                posted_at = datetime.fromisoformat(posted_at_str)
+            except ValueError:
+                continue
+            age_hours = (now - posted_at).total_seconds() / 3600
+            if age_hours >= delay_hours:
+                pending.append(entry)
+        return pending
+
+    def store_engagement(self, state: dict, post_id: str, engagement: dict):
+        now = datetime.now().isoformat()
+        likes = (engagement.get("likes") or {}).get("summary", {}).get("total_count", 0)
+        comments = (engagement.get("comments") or {}).get("summary", {}).get("total_count", 0)
+        shares = (engagement.get("shares") or {}).get("count", 0)
+
+        for entry in state.get("posted", []):
+            if entry.get("post_id") == post_id:
+                entry["engagement"] = {"likes": likes, "comments": comments, "shares": shares}
+                entry["engagement_checked_at"] = now
+                break
+
+        registry = state.get("image_registry", {})
+        for name, meta in registry.items():
+            if meta.get("post_id") == post_id:
+                meta["engagement"] = {"likes": likes, "comments": comments, "shares": shares}
+                break
 
     def record_post_success(
         self,

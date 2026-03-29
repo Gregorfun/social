@@ -119,6 +119,43 @@ def clear_reel_plan(control: dict):
   control["planned_caption_updated_at"] = None
 
 
+def _saved_reel_plan_matches_last_reel(state: dict, control: dict) -> bool:
+  last_reel = get_last_reel(state) or {}
+  planned_images = [str(name) for name in control.get("planned_source_images", []) if str(name)]
+  if not planned_images:
+    return False
+
+  last_sources = [str(name) for name in last_reel.get("source_images", []) if str(name)]
+  if last_sources and planned_images == last_sources:
+    return True
+
+  planned_anchor = str(control.get("planned_anchor_image") or "").strip()
+  last_anchor = str(last_reel.get("image_name") or "").strip()
+  return bool(planned_anchor and last_anchor and planned_anchor == last_anchor)
+
+
+def _preview_matches_saved_plan(control: dict) -> bool:
+  preview_path = str(control.get("preview_path") or "").strip()
+  planned_anchor = str(control.get("planned_anchor_image") or "").strip()
+  if not preview_path or not planned_anchor:
+    return False
+
+  preview_file = Path(preview_path)
+  if not preview_file.exists():
+    return False
+
+  anchor_stem = Path(planned_anchor).stem
+  if not preview_file.stem.startswith(f"{anchor_stem}-reel-"):
+    return False
+
+  preview_updated_at = str(control.get("preview_updated_at") or "").strip()
+  planned_updated_at = str(control.get("planned_updated_at") or "").strip()
+  if planned_updated_at and preview_updated_at and preview_updated_at < planned_updated_at:
+    return False
+
+  return True
+
+
 def regenerate_reel_caption(cfg: dict, state: dict, images: list[Path]) -> dict:
   control = get_reel_control(state)
   control["caption_override"] = ""
@@ -180,9 +217,11 @@ def build_next_reel_plan(cfg: dict, state: dict, images: list[Path]) -> dict:
   available_by_name = {image.name: image for image in available}
   reels_cfg = cfg.get("reels") or {}
   history = PostHistory(STATE_FILE)
-  if _is_saved_reel_plan_valid(control, available_by_name, desired_count, skip_anchors):
+  if _is_saved_reel_plan_valid(control, available_by_name, desired_count, skip_anchors) and not _saved_reel_plan_matches_last_reel(state, control):
     planned_images = [available_by_name[name] for name in control.get("planned_source_images", [])]
   else:
+    clear_reel_preview(control)
+    clear_reel_plan(control)
     planned_images = history.plan_reel_images(
       state=state,
       images=available,
@@ -197,6 +236,9 @@ def build_next_reel_plan(cfg: dict, state: dict, images: list[Path]) -> dict:
     control["planned_source_images"] = [image.name for image in planned_images]
     control["planned_anchor_image"] = planned_images[0].name if planned_images else None
     control["planned_updated_at"] = datetime.now().isoformat() if planned_images else None
+
+  if control.get("preview_path") and not _preview_matches_saved_plan(control):
+    clear_reel_preview(control)
 
   if not planned_images:
     clear_reel_plan(control)
@@ -289,6 +331,7 @@ def build_reel_status(cfg: dict, state: dict, is_running: bool) -> dict:
   return {
     "enabled": reel_cfg.get("enabled", False),
     "simulation_mode": reel_cfg.get("simulation_mode", True),
+    "publish_to_facebook": reel_cfg.get("publish_to_facebook", False),
     "output_folder": reel_cfg.get("output_folder", ""),
     "images_per_reel": reel_cfg.get("images_per_reel", 4),
     "duration_seconds": reel_cfg.get("duration_seconds", 10),
@@ -698,6 +741,46 @@ def api_history():
     return jsonify(history)
 
 
+@app.route("/api/analytics")
+def api_analytics():
+    state = load_state()
+    ph = PostHistory(STATE_FILE)
+
+    trend = ph.get_recent_engagement_trend(state, last_n=5)
+    weights = ph.compute_caption_feature_weights(state)
+    hashtags_raw = ph.compute_hashtag_performance(state)
+    weekday_raw = ph.compute_weekday_performance(state)
+
+    top_hashtags = sorted(
+        [{"tag": t, **d} for t, d in hashtags_raw.items()],
+        key=lambda x: x["avg_score"],
+        reverse=True,
+    )[:15]
+
+    posts_with_data = sum(1 for e in state.get("posted", []) if e.get("engagement"))
+    cfg = load_json(CONFIG_FILE, {})
+    threshold = (cfg.get("engagement") or {}).get("low_engagement_threshold", 5)
+
+    return jsonify({
+        "engagement_trend": trend,
+        "engagement_threshold": threshold,
+        "caption_weights": weights,
+        "hashtag_performance": top_hashtags,
+        "weekday_performance": weekday_raw,
+        "posts_with_engagement": posts_with_data,
+        "total_posts": len(state.get("posted", [])),
+    })
+
+
+@app.route("/api/state/clear-caption-cache", methods=["POST"])
+def api_clear_caption_cache():
+    state = load_state()
+    count = len(state.get("captions", {}))
+    state["captions"] = {}
+    save_json(STATE_FILE, state)
+    return jsonify({"ok": True, "cleared": count, "msg": f"{count} Caption(s) aus dem Cache entfernt."})
+
+
 @app.route("/api/reels")
 def api_reels():
     state = load_state()
@@ -760,6 +843,7 @@ def api_reels_preview():
     return jsonify({"ok": False, "msg": "Kein nächstes Reel zum Vorschauen verfügbar."}), 400
 
   from config import load_settings
+  from facebook_poster import FacebookPoster
   from reel_generator import ReelGenerator
 
   control = get_reel_control(state)
@@ -989,6 +1073,7 @@ def api_reels_generate_now():
     return jsonify({"ok": False, "msg": "Kein nächstes Reel zum Generieren verfügbar."}), 400
 
   from config import load_settings
+  from facebook_poster import FacebookPoster
   from reel_generator import ReelGenerator
 
   settings = load_settings()
@@ -996,6 +1081,19 @@ def api_reels_generate_now():
   result = ReelGenerator(settings).generate_reel(source_paths, plan.get("caption") or settings.ai_disclosure)
   publish_status = "manual-simulated" if settings.reels.simulation_mode else "manual"
   publish_message = "Reel manuell im Dashboard erzeugt, kein externer Upload."
+  published_post_id = None
+  if not settings.reels.simulation_mode and settings.reels.publish_to_facebook and settings.platform == "facebook":
+    publish_result = FacebookPoster(settings).post_reel(result.output_path, plan.get("caption") or settings.ai_disclosure)
+    if publish_result.success:
+      publish_status = "manual-published"
+      publish_message = f"Facebook-Reel veroeffentlicht (Reel-ID: {publish_result.reel_id})."
+      published_post_id = publish_result.reel_id
+    else:
+      publish_status = "manual-failed"
+      publish_message = f"Facebook-Reel-Upload fehlgeschlagen: {publish_result.error or 'Unbekannter Fehler'}"
+      published_post_id = publish_result.reel_id
+  elif not settings.reels.simulation_mode:
+    publish_message = "Reel manuell im Dashboard erzeugt, Facebook-Reel-Upload ist deaktiviert."
   state.setdefault("generated_reels", []).append(
     {
       "image_name": plan.get("anchor_image"),
@@ -1010,15 +1108,21 @@ def api_reels_generate_now():
       "simulation_mode": settings.reels.simulation_mode,
       "publish_status": publish_status,
       "publish_message": publish_message,
+      "published_post_id": published_post_id,
       "time": datetime.now().isoformat(),
     }
   )
   control = get_reel_control(state)
+  clear_reel_preview(control)
   clear_reel_plan(control)
-  control["preview_path"] = str(result.output_path)
-  control["preview_updated_at"] = datetime.now().isoformat()
   save_json(STATE_FILE, state)
-  return jsonify({"ok": True, "reel_path": str(result.output_path)})
+  return jsonify({
+    "ok": True,
+    "reel_path": str(result.output_path),
+    "publish_status": publish_status,
+    "msg": publish_message,
+    "published_post_id": published_post_id,
+  })
 
 
 @app.route("/api/log")
@@ -1126,10 +1230,19 @@ def api_skip_next_image():
 
 @app.route("/api/thumbnail/<path:filename>")
 def api_thumbnail(filename):
-    target = build_image_path(filename)
-    if not target.exists():
-        abort(404)
-    return send_file(target)
+    cfg = load_json(CONFIG_FILE, {})
+    folder = Path(cfg.get("images_folder", "")).resolve()
+    candidates = [
+        (folder / filename).resolve(),
+        (folder / "versendet" / filename).resolve(),
+        (folder / "entfernt" / filename).resolve(),
+    ]
+    for target in candidates:
+        if not str(target).startswith(str(folder)):
+            abort(403)
+        if target.exists():
+            return send_file(target)
+    abort(404)
 
 
 @app.route("/api/source-thumbnail/<path:filename>")
@@ -1176,6 +1289,31 @@ def api_poster_stop():
     with _poster_lock:
         _poster_proc = None
     return jsonify({"ok": True, "msg": "Poster gestoppt."})
+
+@app.route("/api/poster/post-now", methods=["POST"])
+def api_poster_post_now():
+  from config import load_settings
+  from main import AutoPostingService
+
+  settings = load_settings()
+  manual_slot = f"manual-{datetime.now().strftime('%H%M%S')}"
+
+  with _poster_lock:
+    service = AutoPostingService(settings)
+    service.process_slot(manual_slot)
+
+  state = PostHistory(settings.history_file).load()
+  day_key = datetime.now().date().isoformat()
+  slot_run = state.get("slot_runs", {}).get(day_key, {}).get(manual_slot, {})
+  status = slot_run.get("status") or "unknown"
+  message = slot_run.get("message") or "Sofort-Posting wurde verarbeitet."
+  return jsonify({
+      "ok": status == "posted",
+      "status": status,
+      "msg": message,
+      "image_name": slot_run.get("image_name"),
+      "post_id": slot_run.get("post_id"),
+    })
 
 
 # --------------------------------------------------------------------------- #
@@ -1402,10 +1540,21 @@ HTML = r"""<!DOCTYPE html>
     width: 100%; height: min(32vh, 360px); object-fit: contain; display: block; background: #050816;
   }
   .reel-preview-stack {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 10px;
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; padding: 12px;
   }
-  .reel-preview-stack img {
-    width: 100%; height: min(18vh, 140px); object-fit: cover; border-radius: 8px; background: #111;
+  .reel-preview-tile {
+    position: relative; border-radius: 10px; overflow: hidden; border: 1px solid rgba(255,255,255,.08); background: #111;
+  }
+  .reel-preview-tile img {
+    width: 100%; height: min(18vh, 148px); object-fit: cover; display: block; background: #111;
+  }
+  .reel-preview-tile span {
+    position: absolute; left: 8px; right: 8px; bottom: 8px; padding: 5px 8px; border-radius: 999px;
+    background: rgba(5,8,22,.78); color: #f8fafc; font-size: .68rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .reel-preview-tile strong {
+    position: absolute; top: 8px; left: 8px; padding: 4px 8px; border-radius: 999px; background: rgba(94,234,212,.18);
+    color: var(--accent); font-size: .64rem; letter-spacing: .06em; text-transform: uppercase;
   }
   .reel-summary { padding: 12px; }
   .reel-summary-title { font-size: .8rem; font-weight: 700; }
@@ -1436,6 +1585,31 @@ HTML = r"""<!DOCTYPE html>
     content: ''; width: 10px; height: 10px; border-radius: 50%;
     background: var(--yellow); box-shadow: 0 0 0 0 rgba(245,158,11,.5); animation: pulse 1.2s infinite;
   }
+
+  /* Analytics */
+  .analytics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+  @media (max-width: 800px) { .analytics-grid { grid-template-columns: 1fr; } }
+  .analytics-section-title { font-size: .78rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; margin-bottom: 10px; }
+  .analytics-bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .analytics-bar-label { font-size: .78rem; min-width: 130px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .analytics-bar-track { flex: 1; height: 8px; background: rgba(255,255,255,.07); border-radius: 99px; overflow: hidden; }
+  .analytics-bar-fill { height: 100%; border-radius: 99px; background: var(--accent); transition: width .4s; }
+  .analytics-bar-fill.green { background: var(--green); }
+  .analytics-bar-fill.yellow { background: var(--yellow); }
+  .analytics-bar-fill.red { background: var(--red); }
+  .analytics-bar-val { font-size: .75rem; color: var(--muted); min-width: 36px; text-align: right; }
+  .analytics-hashtag-table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+  .analytics-hashtag-table th { color: var(--muted); font-weight: 600; padding: 4px 6px; text-align: left; border-bottom: 1px solid var(--border); }
+  .analytics-hashtag-table td { padding: 5px 6px; border-bottom: 1px solid rgba(255,255,255,.04); }
+  .analytics-engagement-alert {
+    padding: 10px 14px; border-radius: 8px; font-size: .82rem; margin-bottom: 14px;
+    border: 1px solid rgba(239,68,68,.4); background: rgba(239,68,68,.08); color: #fca5a5;
+  }
+  .analytics-engagement-ok {
+    padding: 10px 14px; border-radius: 8px; font-size: .82rem; margin-bottom: 14px;
+    border: 1px solid rgba(34,197,94,.3); background: rgba(34,197,94,.06); color: #86efac;
+  }
+  .analytics-no-data { font-size: .8rem; color: var(--muted); padding: 8px 0; }
 </style>
 </head>
 <body>
@@ -1480,6 +1654,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="card-header">
       Vorschau
       <div class="toolbar-actions">
+        <button class="btn-icon" id="post-now-top" onclick="postNowImage()">Bild jetzt posten</button>
         <button class="btn-icon warn" id="skip-next-top" onclick="skipNextImage()">Nächstes überspringen</button>
         <span id="next-time" class="next-time"></span>
       </div>
@@ -1544,7 +1719,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="card-header">Reel-Vorschau
       <div class="toolbar-actions">
         <span id="dashboard-reel-status"></span>
-        <button class="btn-icon warn" id="dashboard-generate-reel" onclick="generateNowReel()">Reel jetzt generieren</button>
+        <button class="btn-icon warn" id="dashboard-generate-reel" onclick="generateNowReel()">Reel jetzt posten</button>
       </div>
     </div>
     <div class="card-body">
@@ -1563,6 +1738,33 @@ HTML = r"""<!DOCTYPE html>
     <div class="card-header">Reel-Verlauf</div>
     <div class="card-body" style="padding:12px;">
       <div class="reel-list" id="reel-list">Lädt…</div>
+    </div>
+  </div>
+
+  <!-- Analytics -->
+  <div class="card">
+    <div class="card-header">
+      Analytics &amp; Performance
+      <div class="toolbar-actions">
+        <button class="btn-icon" onclick="clearCaptionCache()">Caption-Cache leeren</button>
+      </div>
+    </div>
+    <div class="card-body" style="padding:16px;">
+      <div id="analytics-engagement-status"></div>
+      <div class="analytics-grid">
+        <div>
+          <div class="analytics-section-title">Top-Hashtags nach Engagement</div>
+          <div id="analytics-hashtags"><div class="analytics-no-data">Noch keine Engagement-Daten</div></div>
+        </div>
+        <div>
+          <div class="analytics-section-title">Beste Posting-Zeiten</div>
+          <div id="analytics-weekday"><div class="analytics-no-data">Noch keine Daten</div></div>
+        </div>
+      </div>
+      <div>
+        <div class="analytics-section-title">Caption-Lerngewichte <span id="analytics-weights-data-hint" style="font-weight:400;text-transform:none;letter-spacing:0;"></span></div>
+        <div id="analytics-weights"><div class="analytics-no-data">Noch keine Engagement-Daten (mind. 3 Posts)</div></div>
+      </div>
     </div>
   </div>
 
@@ -1818,10 +2020,11 @@ async function fetchReels() {
     const sourceCount = Array.isArray(item.source_images) ? item.source_images.length : 0;
     const audioLabel = item.audio_track ? `${item.audio_source}: ${item.audio_track}` : (item.audio_source || '–');
     const publishLabel = item.publish_status || (item.simulation_mode ? 'simulated' : 'created');
+    const publishId = item.published_post_id ? ` · Reel-ID ${escapeHtml(item.published_post_id)}` : '';
     return `<div class="reel-item">
       <div>
         <div class="reel-title">${escapeHtml(item.image_name || 'Unbekanntes Bild')}</div>
-        <div class="reel-meta">${time} · ${item.duration_seconds || '–'}s · ${sourceCount} Bilder · Slot ${escapeHtml(item.slot || '–')} · Audio ${escapeHtml(audioLabel)} · Status ${escapeHtml(publishLabel)}</div>
+        <div class="reel-meta">${time} · ${item.duration_seconds || '–'}s · ${sourceCount} Bilder · Slot ${escapeHtml(item.slot || '–')} · Audio ${escapeHtml(audioLabel)} · Status ${escapeHtml(publishLabel)}${publishId}</div>
         <div class="reel-meta">${escapeHtml(item.publish_message || '')}</div>
       </div>
       <div class="reel-actions">
@@ -1840,11 +2043,12 @@ function renderReelPreview(status) {
   if (lastReel && lastReel.reel_path) {
     const encodedPath = encodeURIComponent(lastReel.reel_path);
     const label = lastReel.publish_status || (lastReel.simulation_mode ? 'simulated' : 'created');
+    const reelIdText = lastReel.published_post_id ? `<br>Reel-ID ${escapeHtml(lastReel.published_post_id)}` : '';
     lastBox.innerHTML = `
       <video controls preload="metadata" src="/api/reel-file?path=${encodedPath}"></video>
       <div class="reel-summary">
         <div class="reel-summary-title">Zuletzt ${escapeHtml(label)}</div>
-        <div class="reel-summary-meta">${escapeHtml(lastReel.image_name || 'Unbekanntes Bild')}<br>${escapeHtml(lastReel.publish_message || '')}</div>
+        <div class="reel-summary-meta">${escapeHtml(lastReel.image_name || 'Unbekanntes Bild')}${reelIdText}<br>${escapeHtml(lastReel.publish_message || '')}</div>
       </div>`;
   } else {
     lastBox.innerHTML = '<div class="no-image">Noch kein Reel simuliert</div>';
@@ -1854,8 +2058,12 @@ function renderReelPreview(status) {
   if (Array.isArray(nextReel.source_images) && nextReel.source_images.length) {
     const previewBlock = nextReel.preview_path
       ? `<video controls preload="metadata" src="/api/reel-file?path=${encodeURIComponent(nextReel.preview_path)}"></video>`
-      : `<div class="reel-preview-stack">${nextReel.source_images.slice(0, 3).map(name =>
-          `<img src="/api/source-thumbnail/${encodeURIComponent(name)}" alt="" onerror="this.style.visibility=\'hidden\'">`
+      : `<div class="reel-preview-stack">${nextReel.source_images.slice(0, 4).map((name, index) =>
+          `<div class="reel-preview-tile">
+            <img src="/api/source-thumbnail/${encodeURIComponent(name)}" alt="" onerror="this.parentElement.style.display=\'none\'">
+            ${index === 0 ? '<strong>Startbild</strong>' : ''}
+            <span>${escapeHtml(name)}</span>
+          </div>`
         ).join('')}</div>`;
     nextBox.innerHTML = `
       ${previewBlock}
@@ -1898,9 +2106,100 @@ function setDashboardReelBusy(isBusy, message = 'Reel wird erzeugt...') {
   }
 }
 
+async function fetchAnalytics() {
+  const r = await fetch('/api/analytics');
+  const data = await r.json();
+
+  // Engagement trend alert
+  const statusEl = document.getElementById('analytics-engagement-status');
+  if (data.engagement_trend !== null && data.engagement_trend !== undefined) {
+    const isLow = data.engagement_trend < data.engagement_threshold;
+    statusEl.innerHTML = isLow
+      ? `<div class="analytics-engagement-alert">⚠ Niedriges Engagement erkannt: Ø ${data.engagement_trend} Score (letzte 5 Posts). Schwellenwert: ${data.engagement_threshold}. Bilder oder Posting-Zeiten anpassen.</div>`
+      : `<div class="analytics-engagement-ok">✓ Engagement normal: Ø ${data.engagement_trend} Score (letzte 5 Posts mit Daten)</div>`;
+  } else {
+    statusEl.innerHTML = `<div class="analytics-no-data">Noch keine Engagement-Daten (${data.posts_with_engagement} von ${data.total_posts} Posts mit Daten)</div>`;
+  }
+
+  // Hashtags
+  const hashEl = document.getElementById('analytics-hashtags');
+  if (data.hashtag_performance && data.hashtag_performance.length) {
+    const maxScore = data.hashtag_performance[0].avg_score || 1;
+    hashEl.innerHTML = `<table class="analytics-hashtag-table">
+      <thead><tr><th>Hashtag</th><th>Posts</th><th>Ø Score</th><th></th></tr></thead>
+      <tbody>${data.hashtag_performance.slice(0, 10).map(h => {
+        const pct = Math.round((h.avg_score / maxScore) * 100);
+        const color = pct > 66 ? 'green' : pct > 33 ? 'yellow' : 'red';
+        return `<tr>
+          <td>${escapeHtml(h.tag)}</td>
+          <td style="color:var(--muted)">${h.posts}</td>
+          <td style="color:var(--muted)">${h.avg_score}</td>
+          <td style="width:80px"><div class="analytics-bar-track"><div class="analytics-bar-fill ${color}" style="width:${pct}%"></div></div></td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table>`;
+  } else {
+    hashEl.innerHTML = '<div class="analytics-no-data">Noch keine Hashtag-Daten</div>';
+  }
+
+  // Weekday performance
+  const wdEl = document.getElementById('analytics-weekday');
+  const wdEntries = Object.entries(data.weekday_performance || {}).sort((a, b) => b[1] - a[1]);
+  if (wdEntries.length) {
+    const maxWd = wdEntries[0][1] || 1;
+    wdEl.innerHTML = wdEntries.slice(0, 8).map(([slot, score]) => {
+      const pct = Math.round((score / maxWd) * 100);
+      const color = pct > 66 ? 'green' : pct > 33 ? 'yellow' : 'red';
+      return `<div class="analytics-bar-row">
+        <div class="analytics-bar-label" title="${escapeHtml(slot)}">${escapeHtml(slot)}</div>
+        <div class="analytics-bar-track"><div class="analytics-bar-fill ${color}" style="width:${pct}%"></div></div>
+        <div class="analytics-bar-val">${score}</div>
+      </div>`;
+    }).join('');
+  } else {
+    wdEl.innerHTML = '<div class="analytics-no-data">Noch keine Zeitdaten</div>';
+  }
+
+  // Caption feature weights
+  const weightsEl = document.getElementById('analytics-weights');
+  const hintEl = document.getElementById('analytics-weights-data-hint');
+  const FEATURE_LABELS = {
+    starts_with_question: 'Hook: Frage',
+    starts_with_exclamation: 'Hook: Ausrufezeichen',
+    has_emoji_hook: 'Hook: Emoji',
+    ends_with_question: 'Ende: Frage',
+    optimal_length: 'Optimale Länge',
+  };
+  const wEntries = Object.entries(data.caption_weights || {});
+  hintEl.textContent = data.posts_with_engagement > 0 ? `(${data.posts_with_engagement} Posts mit Daten)` : '';
+  if (wEntries.length) {
+    const maxW = Math.max(...wEntries.map(e => e[1]), 1);
+    weightsEl.innerHTML = wEntries.sort((a,b) => b[1]-a[1]).map(([feat, w]) => {
+      const label = FEATURE_LABELS[feat] || feat;
+      const pct = Math.round(Math.min((w / Math.max(maxW, 1.5)) * 100, 100));
+      const color = w > 1.15 ? 'green' : w > 0.9 ? 'yellow' : 'red';
+      return `<div class="analytics-bar-row">
+        <div class="analytics-bar-label">${escapeHtml(label)}</div>
+        <div class="analytics-bar-track"><div class="analytics-bar-fill ${color}" style="width:${pct}%"></div></div>
+        <div class="analytics-bar-val">${w.toFixed(2)}x</div>
+      </div>`;
+    }).join('');
+  } else {
+    weightsEl.innerHTML = '<div class="analytics-no-data">Noch keine Engagement-Daten (mind. 3 Posts)</div>';
+  }
+}
+
+async function clearCaptionCache() {
+  if (!confirm('Caption-Cache leeren? Alle gespeicherten Captions werden gelöscht und beim nächsten Post neu generiert.')) return;
+  const r = await fetch('/api/state/clear-caption-cache', { method: 'POST' });
+  const data = await r.json();
+  alert(data.msg || 'Cache geleert.');
+  await refresh();
+}
+
 async function refresh() {
   await fetchStatus();
-  await Promise.all([fetchHistory(), fetchQueue(), fetchLog(), fetchReels(), fetchSchedule()]);
+  await Promise.all([fetchHistory(), fetchQueue(), fetchLog(), fetchReels(), fetchSchedule(), fetchAnalytics()]);
 }
 
 function getImageByName(name) {
@@ -1958,17 +2257,46 @@ function openReelInTab() {
 }
 
 async function generateNowReel() {
-  setDashboardReelBusy(true, 'Reel wird manuell erzeugt...');
+  setDashboardReelBusy(true, 'Reel wird manuell verarbeitet...');
   const response = await fetch('/api/reels/generate-now', { method: 'POST' });
   const payload = await response.json();
   setDashboardReelBusy(false);
   if (!response.ok || !payload.ok) {
-    alert(payload.msg || 'Reel konnte nicht erzeugt werden.');
+    alert(payload.msg || 'Reel konnte nicht verarbeitet werden.');
     return;
   }
   await fetchReels();
+  if (payload.msg) {
+    alert(payload.msg);
+  }
   if (payload.reel_path) {
-    openReelModal(encodeURIComponent(payload.reel_path), 'Manuell erzeugtes Reel', 'manual-simulated');
+    openReelModal(encodeURIComponent(payload.reel_path), 'Manuell verarbeitetes Reel', payload.publish_status || 'manual');
+  }
+}
+
+async function postNowImage() {
+  const button = document.getElementById('post-now-top');
+  if (button) {
+    button.disabled = true;
+    button.style.opacity = '.6';
+    button.style.pointerEvents = 'none';
+  }
+
+  try {
+    const response = await fetch('/api/poster/post-now', { method: 'POST' });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      alert(payload.msg || 'Bild konnte nicht sofort gepostet werden.');
+      return;
+    }
+    alert(payload.msg || 'Bild wurde sofort gepostet.');
+    await refresh();
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.style.opacity = '1';
+      button.style.pointerEvents = 'auto';
+    }
   }
 }
 
@@ -2122,9 +2450,20 @@ REELS_HTML = r"""<!DOCTYPE html>
     width: 100%; max-height: min(44vh, 560px); object-fit: contain; display: block; background: #050816;
   }
   .reel-focus-stack {
-    display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; padding: 12px; max-height: min(44vh, 560px); overflow: hidden;
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; padding: 12px; max-height: min(44vh, 560px); overflow: hidden;
   }
-  .reel-focus-stack img { width: 100%; height: min(21vh, 260px); object-fit: cover; border-radius: 10px; }
+  .reel-focus-thumb {
+    position: relative; border-radius: 12px; overflow: hidden; border: 1px solid rgba(148,163,184,.16); background: #050816;
+  }
+  .reel-focus-thumb img { width: 100%; height: min(21vh, 260px); object-fit: cover; display: block; }
+  .reel-focus-thumb span {
+    position: absolute; left: 8px; right: 8px; bottom: 8px; padding: 5px 8px; border-radius: 999px;
+    background: rgba(5,8,22,.78); color: #f8fafc; font-size: .68rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .reel-focus-thumb strong {
+    position: absolute; top: 8px; left: 8px; padding: 4px 8px; border-radius: 999px; background: rgba(94,234,212,.18);
+    color: var(--accent); font-size: .64rem; letter-spacing: .06em; text-transform: uppercase;
+  }
   .reel-focus-meta { padding: 12px; font-size: .8rem; color: var(--muted); line-height: 1.6; }
   .reel-editor { display: grid; gap: 14px; }
   .reel-caption-box {
@@ -2223,7 +2562,7 @@ REELS_HTML = r"""<!DOCTYPE html>
             <button class="btn" data-reel-action onclick="saveNextReelEdits()">Änderungen speichern</button>
             <button class="btn" data-reel-action onclick="regenerateNextReelCaption()">Text neu generieren</button>
             <button class="btn" data-reel-action onclick="generateReelPreview()">Vorschau erzeugen</button>
-            <button class="btn" data-reel-action onclick="generateNowReelWindow()">Reel jetzt generieren</button>
+            <button class="btn" data-reel-action onclick="generateNowReelWindow()">Reel jetzt posten</button>
             <button class="btn" data-reel-action onclick="resetNextReel()">Zurücksetzen</button>
             <button class="btn" data-reel-action onclick="skipNextReel()">Nächstes Reel überspringen</button>
           </div>
@@ -2394,7 +2733,11 @@ function renderReelMonitorFocus(data) {
     const previewBlock = nextReel.preview_path
       ? `<video controls preload="metadata" src="/api/reel-file?path=${encodeURIComponent(nextReel.preview_path || '')}"></video>`
       : `<div class="reel-focus-stack">
-          ${nextReel.source_images.slice(0, 4).map(name => `<img src="/api/source-thumbnail/${encodeURIComponent(name)}" alt="${esc(name)}" title="${esc(name)}" onerror="this.style.visibility='hidden'">`).join('')}
+          ${nextReel.source_images.slice(0, 4).map((name, index) => `<div class="reel-focus-thumb">
+            <img src="/api/source-thumbnail/${encodeURIComponent(name)}" alt="${esc(name)}" title="${esc(name)}" onerror="this.parentElement.style.display='none'">
+            ${index === 0 ? '<strong>Startbild</strong>' : ''}
+            <span>${esc(name)}</span>
+          </div>`).join('')}
         </div>`;
     nextEl.innerHTML = `
       <div class="reel-focus-card">
@@ -2527,13 +2870,16 @@ async function generateReelPreview() {
 }
 
 async function generateNowReelWindow() {
-  setReelWindowBusy(true, 'Reel wird manuell erzeugt...');
+  setReelWindowBusy(true, 'Reel wird manuell verarbeitet...');
   const response = await fetch('/api/reels/generate-now', { method: 'POST' });
   const payload = await response.json();
   setReelWindowBusy(false);
   if (!response.ok || !payload.ok) {
-    alert(payload.msg || 'Reel konnte nicht erzeugt werden.');
+    alert(payload.msg || 'Reel konnte nicht verarbeitet werden.');
     return;
+  }
+  if (payload.msg) {
+    alert(payload.msg);
   }
   await refreshReelsWindow();
 }
