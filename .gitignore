@@ -12,3 +12,6 @@ state.json
 poster.log
 
 generated_reels/
+generated_stories/
+images/
+.codex

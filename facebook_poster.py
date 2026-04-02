@@ -74,6 +74,7 @@ class FacebookPoster:
             permission
             for permission in (
                 "pages_manage_engagement",
+                "pages_read_engagement",
                 "pages_read_user_content",
                 "pages_manage_posts",
                 "pages_show_list",
@@ -197,7 +198,7 @@ class FacebookPoster:
                 log.warning("Facebook-Post-Retry %d/%d nach %.0fs Wartezeit ...", attempt + 1, max_attempts, retry.delay_seconds)
                 time.sleep(retry.delay_seconds)
 
-            result = self._post_photo_once(image_path, caption)
+            result = self._post_photo_once(image_path, caption, published=True)
             if result.success:
                 return result
             last_error = result.error or last_error
@@ -207,7 +208,66 @@ class FacebookPoster:
 
         return FacebookPostResult(success=False, error=last_error)
 
-    def _post_photo_once(self, image_path: Path, caption: str) -> FacebookPostResult:
+    def post_story_photo(self, image_path: Path) -> FacebookPostResult:
+        if self.config.dry_run:
+            return FacebookPostResult(success=True, post_id="dry-run")
+
+        if not self.config.facebook.page_id or not self.config.facebook.access_token:
+            return FacebookPostResult(success=False, error="Facebook-Zugangsdaten fehlen.", permanent=True)
+
+        validation_error = self._validate_image(image_path)
+        if validation_error:
+            return FacebookPostResult(success=False, error=f"Bildvalidierung fehlgeschlagen: {validation_error}", permanent=True)
+
+        retry = self.config.retry
+        max_attempts = retry.max_attempts if retry.enabled else 1
+        last_error: str = "Unbekannter Fehler"
+
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                log.warning("Facebook-Story-Retry %d/%d nach %.0fs Wartezeit ...", attempt + 1, max_attempts, retry.delay_seconds)
+                time.sleep(retry.delay_seconds)
+
+            result = self._post_story_photo_once(image_path)
+            if result.success:
+                return result
+            last_error = result.error or last_error
+            if result.permanent:
+                return result
+            log.warning("Facebook-Story-Versuch %d fehlgeschlagen: %s", attempt + 1, last_error)
+
+        return FacebookPostResult(success=False, error=last_error)
+
+    def _post_story_photo_once(self, image_path: Path) -> FacebookPostResult:
+        upload_result = self._post_photo_once(image_path, caption="", published=False)
+        if not upload_result.success:
+            return upload_result
+
+        try:
+            response = requests.post(
+                f"{GRAPH_BASE}/{self.config.facebook.page_id}/photo_stories",
+                data={
+                    "photo_id": upload_result.post_id,
+                    "access_token": self.config.facebook.access_token,
+                },
+                timeout=60,
+            )
+        except Exception as exc:
+            return FacebookPostResult(success=False, error=str(exc))
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+
+        if response.ok and payload.get("success"):
+            story_post_id = str(payload.get("post_id") or upload_result.post_id or "")
+            return FacebookPostResult(success=True, post_id=story_post_id)
+
+        message, permanent, _ = self._parse_graph_error(response)
+        return FacebookPostResult(success=False, error=message, permanent=permanent)
+
+    def _post_photo_once(self, image_path: Path, caption: str, published: bool) -> FacebookPostResult:
         url = f"{GRAPH_BASE}/{self.config.facebook.page_id}/photos"
         upload_path, temp_path = self._prepare_upload_image(image_path)
         try:
@@ -217,6 +277,7 @@ class FacebookPoster:
                     url,
                     data={
                         "caption": caption,
+                        "published": str(bool(published)).lower(),
                         "access_token": self.config.facebook.access_token,
                     },
                     files=files,

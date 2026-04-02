@@ -5,6 +5,7 @@ import math
 import os
 import subprocess
 import textwrap
+import unicodedata
 import wave
 import re
 from dataclasses import dataclass
@@ -250,8 +251,8 @@ class ReelGenerator:
             overlay_draw.rectangle((0, y, width, y + 1), fill=(8, 10, 20, alpha))
         frame_rgba.alpha_composite(overlay)
 
-        title_size = max(34, int(width * 0.043))
-        body_size = max(24, int(width * 0.029))
+        title_size = max(42, int(width * 0.052))
+        body_size = max(30, int(width * 0.036))
         text_x = int(width * 0.06)
         text_max_width = width - (text_x * 2)
         current_y = height - gradient_height + int(height * 0.075)
@@ -278,7 +279,7 @@ class ReelGenerator:
         disclaimer_lines = {line.strip() for line in self.config.ai_disclosure.splitlines() if line.strip()}
 
         for line in caption.splitlines():
-            stripped = line.strip()
+            stripped = self._sanitize_overlay_text(line)
             if not stripped:
                 continue
             if stripped in disclaimer_lines:
@@ -329,6 +330,18 @@ class ReelGenerator:
         clipped[-1] = textwrap.shorten(" ".join(wrapped[limit - 1:]), width=max(width - 1, 8), placeholder="...")
         return clipped
 
+    def _sanitize_overlay_text(self, text: str) -> str:
+        cleaned_chars: list[str] = []
+        for char in text:
+            category = unicodedata.category(char)
+            if category in {"So", "Cs"}:
+                continue
+            cleaned_chars.append(char)
+
+        cleaned = "".join(cleaned_chars)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—|•·")
+        return cleaned
+
     def _fit_overlay_font(
         self,
         draw: ImageDraw.ImageDraw,
@@ -337,13 +350,13 @@ class ReelGenerator:
         max_width: int,
     ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         size = preferred_size
-        while size > 20:
+        while size > 26:
             font = self._load_font(size)
             bbox = draw.textbbox((0, 0), text, font=font, stroke_width=2)
             if (bbox[2] - bbox[0]) <= max_width:
                 return font
             size -= 2
-        return self._load_font(20)
+        return self._load_font(26)
 
     def _resize_cover(self, image: Image.Image, width: int, height: int) -> Image.Image:
         ratio = max(width / image.width, height / image.height)
@@ -352,12 +365,24 @@ class ReelGenerator:
 
     def _load_font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         candidates = [
+            os.getenv("REELS_FONT_PATH", "").strip(),
             "C:/Windows/Fonts/arialbd.ttf",
             "C:/Windows/Fonts/arial.ttf",
             "C:/Windows/Fonts/segoeuib.ttf",
             "C:/Windows/Fonts/segoeui.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Helvetica.ttc",
         ]
         for candidate in candidates:
+            if not candidate:
+                continue
             path = Path(candidate)
             if path.exists():
                 try:

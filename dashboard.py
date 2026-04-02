@@ -12,16 +12,20 @@ Start: python dashboard.py
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import threading
 import base64
 import mimetypes
+import random
 from pathlib import Path
 from datetime import datetime, timedelta, time
+import time as time_module
 
 from flask import Flask, jsonify, render_template_string, send_file, abort, request
+from dotenv import load_dotenv
 from caption_generator import CaptionGenerator
 from post_history import PostHistory
 
@@ -29,10 +33,52 @@ CONFIG_FILE = Path(__file__).parent / "config.json"
 STATE_FILE  = Path(__file__).parent / "state.json"
 LOG_FILE    = Path(__file__).parent / "poster.log"
 
+load_dotenv(Path(__file__).parent / ".env")
+
 app = Flask(__name__)
 
 _poster_proc: subprocess.Popen | None = None
 _poster_lock = threading.Lock()
+_instagram_monitor_cache: dict[str, object] = {"timestamp": 0.0, "payload": None}
+_IGNORED_THEME_PREFIXES = {"alle", "auto"}
+
+
+def _dashboard_auth_enabled() -> bool:
+  return bool(os.getenv("DASHBOARD_USERNAME") and os.getenv("DASHBOARD_PASSWORD"))
+
+
+def _poster_systemd_service() -> str:
+  return os.getenv("POSTER_SYSTEMD_SERVICE", "").strip()
+
+
+def _run_systemctl(*args: str) -> subprocess.CompletedProcess[str]:
+  return subprocess.run(
+    ["systemctl", *args],
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+
+
+@app.before_request
+def require_basic_auth():
+  if request.path.startswith("/public-media/") or request.path.startswith("/ig-tmp/"):
+    return None
+
+  if not _dashboard_auth_enabled():
+    return None
+
+  auth = request.authorization
+  username = os.getenv("DASHBOARD_USERNAME", "")
+  password = os.getenv("DASHBOARD_PASSWORD", "")
+  if auth and auth.username == username and auth.password == password:
+    return None
+
+  return app.response_class(
+    "Authentifizierung erforderlich.",
+    401,
+    {"WWW-Authenticate": 'Basic realm="Social Dashboard"'},
+  )
 
 
 def default_state() -> dict:
@@ -45,6 +91,14 @@ def default_state() -> dict:
     "image_registry": {},
     "slot_runs": {},
     "generated_reels": [],
+    "auto_comment_history": [],
+    "auto_comment_cache": [],
+    "auto_comment_metrics": {},
+    "campaign_state": {},
+    "queue_state": {},
+    "content_quality": {},
+    "engagement_actions": {},
+    "outreach_assist": {"items": []},
   }
 
 
@@ -64,11 +118,408 @@ def save_json(path: Path, payload: dict):
     json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
+def prune_generated_reels(state: dict, cfg: dict, keep_last: int = 20):
+  reel_cfg = cfg.get("reels") or {}
+  output_folder = Path(str(reel_cfg.get("output_folder") or (Path(__file__).parent / "generated_reels")))
+  PostHistory(STATE_FILE).prune_generated_reels(state, output_folder, keep_last=keep_last)
+
+
 def load_state() -> dict:
   state = load_json(STATE_FILE, default_state())
   for key, value in default_state().items():
     state.setdefault(key, value)
   return state
+
+
+def build_auto_comment_stats(state: dict) -> dict:
+  metrics = state.get("auto_comment_metrics", {}) or {}
+  history = list(reversed(state.get("auto_comment_history", [])))[:8]
+  cache = state.get("auto_comment_cache", []) or []
+  return {
+    "template_used": int(metrics.get("template_used", 0) or 0),
+    "ollama_used": int(metrics.get("ollama_used", 0) or 0),
+    "ollama_generated": int(metrics.get("ollama_generated", 0) or 0),
+    "ollama_filtered": int(metrics.get("ollama_filtered", 0) or 0),
+    "cache_hits": int(metrics.get("cache_hits", 0) or 0),
+    "template_fallbacks": int(metrics.get("template_fallbacks", 0) or 0),
+    "cache_size": len(cache),
+    "recent": history,
+  }
+
+
+def resolve_dashboard_campaign_context(cfg: dict, state: dict, now: datetime | None = None) -> dict:
+  now = now or datetime.now()
+  campaign_cfg = cfg.get("campaigns") or {}
+  campaign_state = state.get("campaign_state") or {}
+  override_theme = str(((campaign_cfg.get("daily_theme_overrides") or {}).get(now.date().isoformat())) or "").strip().lower()
+  if override_theme:
+    return {
+      "active_campaign": "Tages-Thema",
+      "active_theme": override_theme,
+      "mode": "theme",
+      "override_campaign": str(campaign_state.get("campaign_override") or "").strip(),
+    }
+
+  weekday_key = now.strftime("%A").lower()
+  weekday_mode = str(((campaign_cfg.get("weekday_modes") or {}).get(weekday_key, "theme")) or "theme").strip().lower()
+  if weekday_mode not in {"theme", "mix"}:
+    weekday_mode = "theme"
+
+  override_campaign = str(campaign_state.get("campaign_override") or "").strip()
+  configured_campaigns = [item for item in (campaign_cfg.get("campaigns") or []) if isinstance(item, dict)]
+  target_campaign = None
+  if override_campaign:
+    target_campaign = next((item for item in configured_campaigns if str(item.get("name") or "").strip() == override_campaign), None)
+  if target_campaign is None:
+    active_name = str(campaign_cfg.get("active_campaign_name") or "").strip()
+    if active_name:
+      target_campaign = next((item for item in configured_campaigns if str(item.get("name") or "").strip() == active_name), None)
+  if target_campaign is None:
+    for item in configured_campaigns:
+      start_date = str(item.get("start_date") or "").strip()
+      end_date = str(item.get("end_date") or "").strip()
+      if start_date and now.date().isoformat() < start_date:
+        continue
+      if end_date and now.date().isoformat() > end_date:
+        continue
+      target_campaign = item
+      break
+  if target_campaign is None and bool(campaign_cfg.get("auto_rotate", False)) and configured_campaigns:
+    target_campaign = configured_campaigns[now.toordinal() % len(configured_campaigns)]
+
+  active_campaign = str(campaign_state.get("active_campaign") or "").strip()
+  active_theme = str(campaign_state.get("active_theme") or "").strip().lower()
+  if weekday_mode == "mix":
+    return {
+      "active_campaign": "Querbeet",
+      "active_theme": "",
+      "mode": "mix",
+      "override_campaign": override_campaign,
+    }
+
+  if target_campaign:
+    themes = [str(theme).strip().lower() for theme in target_campaign.get("themes", []) if str(theme).strip()]
+    days_per_theme = max(1, int(target_campaign.get("days_per_theme", campaign_cfg.get("default_days_per_theme", 2)) or 2))
+    if themes:
+      active_campaign = str(target_campaign.get("name") or "").strip() or active_campaign
+      active_theme = themes[((now.date().toordinal()) // days_per_theme) % len(themes)]
+
+  return {
+    "active_campaign": active_campaign,
+    "active_theme": active_theme,
+    "mode": "theme",
+    "override_campaign": override_campaign,
+  }
+
+
+def build_outreach_assist_overview(state: dict) -> dict:
+  items = list(reversed(((state.get("outreach_assist") or {}).get("items") or [])))[:12]
+  used = sum(1 for item in items if str(item.get("status") or "") == "used")
+  pending = sum(1 for item in items if str(item.get("status") or "pending") == "pending")
+  skipped = sum(1 for item in items if str(item.get("status") or "") == "skipped")
+  return {
+    "used": used,
+    "pending": pending,
+    "skipped": skipped,
+    "items": items,
+  }
+
+
+_OUTREACH_STOPWORDS = {
+  "und", "oder", "aber", "eine", "einer", "einem", "einen", "der", "die", "das", "den", "dem",
+  "mit", "von", "für", "fuer", "zum", "zur", "ist", "sind", "war", "noch", "schon", "hier",
+  "auch", "wirklich", "dieses", "dieser", "diese", "post", "bild", "video", "reel", "look",
+  "sehr", "mehr", "weniger", "einfach", "gerade", "fast", "bald", "echt", "oder", "ki", "ai",
+}
+
+
+def _extract_outreach_keywords(text: str, limit: int = 3) -> list[str]:
+  words = re.findall(r"[a-zA-ZäöüÄÖÜß0-9_]+", (text or "").lower())
+  seen: list[str] = []
+  for word in words:
+    if len(word) < 4 or word in _OUTREACH_STOPWORDS:
+      continue
+    if word not in seen:
+      seen.append(word)
+    if len(seen) >= limit:
+      break
+  return seen
+
+
+def _build_outreach_suggestions(platform: str, creator_handle: str, post_caption: str, theme: str, note: str) -> list[str]:
+  context = " / ".join(part for part in [theme.strip(), *(_extract_outreach_keywords(post_caption)[:2])] if part).strip(" /")
+  focus = context or "Bildstimmung"
+  closers = [
+    "Das bleibt direkt haengen.",
+    "So etwas stoppt sofort den Scroll.",
+    "Die Wirkung ist richtig stark.",
+    "Das wirkt ungewoehnlich sauber gebaut.",
+    "Der Look bleibt direkt im Kopf.",
+  ]
+  lead_ins = [
+    f"Die {focus} hier ist richtig stark.",
+    f"Gerade die {focus} macht den Post spannend.",
+    f"Der {focus}-Vibe funktioniert hier sofort.",
+    f"Bei {focus} passt die Stimmung komplett.",
+    f"Das Detailgefuehl bei {focus} ist echt stark.",
+  ]
+  specifics = [
+    "Vor allem Licht und Ausstrahlung passen zusammen.",
+    "Gerade die ruhige Wirkung macht es spannend.",
+    "Die Komposition fuehlt sich sehr stimmig an.",
+    "Vor allem die Details ziehen den Blick an.",
+    "Genau so etwas bleibt beim zweiten Hinschauen haengen.",
+  ]
+  if creator_handle.strip():
+    specifics.append(f"Passt stark zum Stil von {creator_handle.strip()}.")
+  if note.strip():
+    specifics.append(f"Vor allem {note.strip()[:60]} wirkt hier gut eingebaut.")
+
+  combinations: list[str] = []
+  for idx in range(5):
+    lead = lead_ins[idx % len(lead_ins)]
+    detail = specifics[idx % len(specifics)]
+    close = closers[idx % len(closers)]
+    combinations.append(f"{lead} {detail} {close}")
+
+  random.seed(f"{platform}|{creator_handle}|{post_caption}|{theme}|{note}")
+  random.shuffle(combinations)
+  selected: list[str] = []
+  for comment in combinations:
+    if comment not in selected:
+      selected.append(comment)
+    if len(selected) >= 3:
+      break
+  return selected
+
+
+def build_campaign_overview(cfg: dict, state: dict) -> dict:
+  campaign_cfg = cfg.get("campaigns") or {}
+  campaign_state = state.get("campaign_state") or {}
+  resolved_context = resolve_dashboard_campaign_context(cfg, state)
+  active_campaign = str(resolved_context.get("active_campaign") or "").strip()
+  active_theme = str(resolved_context.get("active_theme") or "").strip()
+  override_campaign = str(resolved_context.get("override_campaign") or "").strip()
+  current_mode = str(resolved_context.get("mode") or "theme").strip()
+
+  theme_counts: dict[str, int] = {}
+  for entry in state.get("posted", []):
+    campaign = entry.get("campaign") or {}
+    theme = str(campaign.get("theme") or "").strip()
+    if theme:
+      theme_counts[theme] = theme_counts.get(theme, 0) + 1
+
+  ph = PostHistory(STATE_FILE)
+  configured_campaigns = []
+  for item in campaign_cfg.get("campaigns", []):
+    if not isinstance(item, dict):
+      continue
+    name = str(item.get("name") or "").strip()
+    progress = ph.compute_campaign_progress(state, name) if name else {"feed_posts": 0, "stories": 0, "reels": 0}
+    configured_campaigns.append({
+      "name": name,
+      "themes": [str(theme).strip() for theme in item.get("themes", []) if str(theme).strip()],
+      "preferred_slots": [str(slot).strip() for slot in item.get("preferred_slots", []) if str(slot).strip()],
+      "targets": {
+        "feed_posts": int(item.get("target_feed_posts", 0) or 0),
+        "stories": int(item.get("target_stories", 0) or 0),
+        "reels": int(item.get("target_reels", 0) or 0),
+      },
+      "progress": progress,
+    })
+
+  theme_calendar: list[dict] = []
+  if configured_campaigns:
+    active_definition = next((item for item in configured_campaigns if item["name"] == (override_campaign or active_campaign)), configured_campaigns[0])
+    themes = active_definition.get("themes", []) or [active_theme]
+    days_per_theme = max(1, int(next((item.get("days_per_theme", 2) for item in campaign_cfg.get("campaigns", []) if str(item.get("name") or "") == active_definition["name"]), campaign_cfg.get("default_days_per_theme", 2)) or 2))
+    for offset in range(7):
+      day = datetime.now().date() + timedelta(days=offset)
+      override_theme = str(((campaign_cfg.get("daily_theme_overrides") or {}).get(day.isoformat())) or "").strip().lower()
+      weekday_key = day.strftime("%A").lower()
+      weekday_mode = str(((campaign_cfg.get("weekday_modes") or {}).get(weekday_key, "theme")) or "theme").strip().lower()
+      if override_theme:
+        theme_calendar.append({"date": day.isoformat(), "theme": override_theme, "mode": "theme", "source": "override"})
+        continue
+      if weekday_mode == "mix":
+        theme_calendar.append({"date": day.isoformat(), "theme": "Querbeet", "mode": "mix", "source": "weekday_mode"})
+        continue
+      theme = themes[((day.toordinal()) // days_per_theme) % max(len(themes), 1)] if themes else active_theme
+      theme_calendar.append({"date": day.isoformat(), "theme": theme, "mode": "theme", "source": "campaign"})
+
+  return {
+    "enabled": bool(campaign_cfg.get("enabled", False)),
+    "active_campaign": active_campaign,
+    "override_campaign": override_campaign,
+    "active_theme": active_theme,
+    "current_mode": current_mode,
+    "last_updated_at": campaign_state.get("last_updated_at"),
+    "fallback_to_detected_themes": bool(campaign_cfg.get("fallback_to_detected_themes", True)),
+    "configured_campaigns": configured_campaigns,
+    "theme_post_counts": theme_counts,
+    "theme_calendar": theme_calendar,
+  }
+
+
+def build_smart_slot_overview(cfg: dict, state: dict) -> dict:
+  smart_cfg = cfg.get("smart_slots") or {}
+  smart_state = state.get("smart_slot_state") or {}
+  return {
+    "enabled": bool(smart_cfg.get("enabled", False)),
+    "exploration_rate": float(smart_cfg.get("exploration_rate", 0.0) or 0.0),
+    "last_applied_slots": list(smart_state.get("last_applied_slots", []) or []),
+    "last_sources": dict(smart_state.get("last_sources", {}) or {}),
+    "last_updated_at": smart_state.get("last_updated_at"),
+  }
+
+
+def build_content_quality_overview(state: dict) -> dict:
+  quality_state = state.get("content_quality") or {}
+  registry = state.get("image_registry") or {}
+  diagnostics = list(quality_state.get("diagnostics", []) or [])
+  duplicates = [
+    {"file": name, "duplicate_of": meta.get("duplicate_of"), "quality_score": meta.get("quality_score")}
+    for name, meta in registry.items()
+    if meta.get("duplicate_of")
+  ]
+  lowest_quality = sorted(
+    [
+      {"file": name, "quality_score": int(meta.get("quality_score", 0) or 0), "theme": meta.get("theme", "")}
+      for name, meta in registry.items()
+      if "quality_score" in meta
+    ],
+    key=lambda item: item["quality_score"],
+  )[:8]
+  return {
+    "last_scan_at": quality_state.get("last_scan_at"),
+    "diagnostics": diagnostics[-20:],
+    "duplicates": duplicates[:20],
+    "lowest_quality": lowest_quality,
+  }
+
+
+def build_engagement_actions_overview(state: dict) -> dict:
+  actions = state.get("engagement_actions") or {}
+  return {
+    "alerts": list(reversed(actions.get("alerts", []) or []))[:12],
+    "recycle_queue": list(reversed(actions.get("recycle_queue", []) or []))[:12],
+    "followup_comments": list(reversed(actions.get("followup_comments", []) or []))[:12],
+  }
+
+
+def infer_dashboard_image_theme(filename: str, separator: str = "_") -> str:
+  stem = Path(str(filename or "")).stem
+  if not stem:
+    return ""
+  if separator and separator in stem:
+    theme = stem.split(separator, maxsplit=1)[0]
+  else:
+    theme = re.split(r"[-\s]+", stem, maxsplit=1)[0]
+  theme = re.sub(r"\d+$", "", theme).strip(" _-").lower()
+  if theme in _IGNORED_THEME_PREFIXES:
+    return ""
+  return theme
+
+
+def _instagram_recent_items_from_state(state: dict, limit: int = 12) -> list[dict]:
+  items: list[dict] = []
+
+  for entry in state.get("posted", []):
+    media_id = str(entry.get("instagram_post_id") or "").strip()
+    if not media_id:
+      continue
+    items.append({
+      "media_id": media_id,
+      "content_type": "image",
+      "file": str(entry.get("file") or "").strip(),
+      "caption": str(entry.get("caption") or "").strip(),
+      "time": str(entry.get("time") or "").strip(),
+      "slot": str(entry.get("slot") or "").strip(),
+      "platform_message": str(((entry.get("platform_results") or {}).get("instagram") or {}).get("message") or "").strip(),
+    })
+
+  for entry in state.get("generated_reels", []):
+    media_id = str(entry.get("instagram_post_id") or "").strip()
+    if not media_id:
+      continue
+    items.append({
+      "media_id": media_id,
+      "content_type": "reel",
+      "file": str(entry.get("image_name") or Path(str(entry.get("reel_path") or "")).name),
+      "caption": str(entry.get("caption") or "").strip(),
+      "time": str(entry.get("time") or "").strip(),
+      "slot": str(entry.get("slot") or "").strip(),
+      "platform_message": str(((entry.get("platform_results") or {}).get("instagram") or {}).get("message") or "").strip(),
+    })
+
+  for entry in state.get("generated_stories", []):
+    media_id = str(entry.get("instagram_post_id") or "").strip()
+    if not media_id:
+      continue
+    items.append({
+      "media_id": media_id,
+      "content_type": "story",
+      "file": Path(str(entry.get("story_path") or "story")).name,
+      "caption": str(entry.get("text") or "").strip(),
+      "time": str(entry.get("time") or "").strip(),
+      "slot": str(entry.get("slot") or "").strip(),
+      "platform_message": str(((entry.get("platform_results") or {}).get("instagram") or {}).get("message") or "").strip(),
+    })
+
+  items.sort(key=lambda item: item.get("time") or "", reverse=True)
+  return items[:limit]
+
+
+def build_instagram_monitor_payload(force_refresh: bool = False) -> dict:
+  now = time_module.time()
+  cached_payload = _instagram_monitor_cache.get("payload")
+  cached_at = float(_instagram_monitor_cache.get("timestamp") or 0.0)
+  if not force_refresh and cached_payload is not None and (now - cached_at) < 60:
+    return cached_payload  # type: ignore[return-value]
+
+  from config import load_settings
+  from instagram_poster import InstagramPoster
+
+  settings = load_settings()
+  state = load_state()
+  history_items = _instagram_recent_items_from_state(state)
+
+  payload = {
+    "enabled": bool(settings.instagram.enabled),
+    "publish_posts": bool(settings.instagram.publish_posts),
+    "publish_reels": bool(settings.instagram.publish_reels),
+    "publish_stories": bool(settings.instagram.publish_stories),
+    "username": str(settings.instagram.username or "").strip(),
+    "business_account_id": str(settings.instagram.business_account_id or "").strip(),
+    "public_base_url": str(settings.instagram.public_base_url or "").strip(),
+    "public_path_prefix": str(settings.instagram.public_path_prefix or "").strip(),
+    "remote_staging_enabled": bool(settings.instagram.remote_staging_enabled),
+    "remote_target": f"{settings.instagram.remote_user}@{settings.instagram.remote_host}:{settings.instagram.remote_path}" if settings.instagram.remote_staging_enabled else "",
+    "profile": {},
+    "recent_media": [],
+    "totals": {
+      "tracked_media": len(history_items),
+      "images": sum(1 for item in history_items if item.get("content_type") == "image"),
+      "reels": sum(1 for item in history_items if item.get("content_type") == "reel"),
+      "stories": sum(1 for item in history_items if item.get("content_type") == "story"),
+    },
+    "last_updated": datetime.now().isoformat(),
+  }
+
+  if settings.instagram.enabled:
+    poster = InstagramPoster(settings)
+    payload["profile"] = poster.fetch_account_overview()
+    recent_media = []
+    for item in history_items[:8]:
+      snapshot = poster.fetch_media_snapshot(str(item.get("media_id") or ""))
+      recent_media.append({**item, **snapshot})
+    payload["recent_media"] = recent_media
+  else:
+    payload["profile"] = {"enabled": False, "error": "Instagram ist deaktiviert."}
+
+  _instagram_monitor_cache["timestamp"] = now
+  _instagram_monitor_cache["payload"] = payload
+  return payload
 
 
 def get_recent_reels(state: dict, limit: int = 12) -> list[dict]:
@@ -684,6 +1135,11 @@ def get_root_poster_process_ids(processes: list[dict]) -> list[int]:
 
 def poster_running() -> bool:
   global _poster_proc
+  service_name = _poster_systemd_service()
+  if service_name:
+    result = _run_systemctl("is-active", service_name)
+    if result.returncode == 0:
+      return True
   with _poster_lock:
     managed_running = _poster_proc is not None and _poster_proc.poll() is None
   return managed_running or bool(list_poster_processes())
@@ -722,8 +1178,8 @@ def api_status():
         "dry_run":         cfg.get("dry_run", True),
         "platform":        cfg.get("platform", "facebook"),
         "selection_mode":  cfg.get("selection_mode", "random"),
-      "posting_slots":   posting_slots,
-      "max_posts_per_day": cfg.get("max_posts_per_day", len(posting_slots) or 0),
+        "posting_slots":   posting_slots,
+        "max_posts_per_day": cfg.get("max_posts_per_day", len(posting_slots) or 0),
         "total_images":    total,
         "posted_count":    len(posted_list),
         "last_image":      last_image,
@@ -731,6 +1187,10 @@ def api_status():
         "next_post_time":  next_post_time,
         "loop":            cfg.get("loop", True),
         "images_folder":   folder,
+        "auto_comment":    build_auto_comment_stats(state),
+        "campaign":        build_campaign_overview(cfg, state),
+        "smart_slots":     build_smart_slot_overview(cfg, state),
+        "queue_state":     state.get("queue_state", {}),
     })
 
 
@@ -750,15 +1210,35 @@ def api_analytics():
     weights = ph.compute_caption_feature_weights(state)
     hashtags_raw = ph.compute_hashtag_performance(state)
     weekday_raw = ph.compute_weekday_performance(state)
-
+    hook_data = ph.compute_hook_performance(state)
+    cta_data = ph.compute_cta_performance(state)
+    format_data = ph.compute_format_performance(state)
+    top_posts = ph.compute_top_posts(state)
+    experiment_stats = ph.compute_caption_experiment_stats(
+        state,
+        int(((cfg := load_json(CONFIG_FILE, {})).get("caption_experiments") or {}).get("min_data_points", 4)),
+    )
+    image_experiment_stats = ph.compute_caption_experiment_stats(
+        state,
+        int(((cfg.get("caption_experiments") or {}).get("min_data_points", 4))),
+        content_type="image",
+    )
+    reel_experiment_stats = ph.compute_caption_experiment_stats(
+        state,
+        int(((cfg.get("caption_experiments") or {}).get("min_data_points", 4))),
+        content_type="reel",
+    )
+    style_winners = ph.compute_caption_style_winners(
+        state,
+        int(((cfg.get("caption_experiments") or {}).get("min_data_points", 4))),
+    )
     top_hashtags = sorted(
         [{"tag": t, **d} for t, d in hashtags_raw.items()],
         key=lambda x: x["avg_score"],
         reverse=True,
     )[:15]
 
-    posts_with_data = sum(1 for e in state.get("posted", []) if e.get("engagement"))
-    cfg = load_json(CONFIG_FILE, {})
+    posts_with_data = sum(1 for e in state.get("posted", []) if e.get("engagement")) + sum(1 for e in state.get("generated_reels", []) if e.get("engagement"))
     threshold = (cfg.get("engagement") or {}).get("low_engagement_threshold", 5)
 
     return jsonify({
@@ -767,9 +1247,122 @@ def api_analytics():
         "caption_weights": weights,
         "hashtag_performance": top_hashtags,
         "weekday_performance": weekday_raw,
+        "hook_performance": hook_data,
+        "cta_performance": cta_data,
+        "format_performance": format_data,
+        "top_posts": top_posts,
         "posts_with_engagement": posts_with_data,
-        "total_posts": len(state.get("posted", [])),
+        "total_posts": len(state.get("posted", [])) + len(state.get("generated_reels", [])),
+        "auto_comment": build_auto_comment_stats(state),
+        "campaign": build_campaign_overview(cfg, state),
+        "smart_slots": build_smart_slot_overview(cfg, state),
+        "content_quality": build_content_quality_overview(state),
+        "engagement_actions": build_engagement_actions_overview(state),
+        "caption_experiments": {
+            "enabled": bool((cfg.get("caption_experiments") or {}).get("enabled", False)),
+            "exploration_rate": float((cfg.get("caption_experiments") or {}).get("exploration_rate", 0.0) or 0.0),
+            "hook_weights": experiment_stats.get("hook_weights", {}),
+            "cta_weights": experiment_stats.get("cta_weights", {}),
+            "hook_counts": experiment_stats.get("hook_counts", {}),
+            "cta_counts": experiment_stats.get("cta_counts", {}),
+            "image": image_experiment_stats,
+            "reel": reel_experiment_stats,
+            "winners": style_winners,
+        },
     })
+
+
+@app.route("/api/outreach-assist")
+def api_outreach_assist():
+  state = load_state()
+  return jsonify(build_outreach_assist_overview(state))
+
+
+@app.route("/api/outreach-assist", methods=["POST"])
+def api_outreach_assist_create():
+  state = load_state()
+  payload = request.get_json(silent=True) or {}
+  creator_handle = str(payload.get("creator_handle") or "").strip()
+  post_caption = str(payload.get("post_caption") or "").strip()
+  if not creator_handle and not post_caption:
+    return jsonify({"ok": False, "error": "Bitte Handle oder Post-Text angeben."}), 400
+
+  platform = str(payload.get("platform") or "instagram").strip().lower()
+  theme = str(payload.get("theme") or "").strip()
+  post_url = str(payload.get("post_url") or "").strip()
+  note = str(payload.get("note") or "").strip()
+  suggestions = _build_outreach_suggestions(platform, creator_handle, post_caption, theme, note)
+
+  outreach_state = state.setdefault("outreach_assist", {"items": []})
+  items = outreach_state.setdefault("items", [])
+  item_id = f"outreach-{int(time_module.time() * 1000)}"
+  items.append({
+    "id": item_id,
+    "platform": platform,
+    "creator_handle": creator_handle,
+    "post_caption": post_caption,
+    "theme": theme,
+    "post_url": post_url,
+    "note": note,
+    "status": "pending",
+    "selected_comment": "",
+    "suggestions": suggestions,
+    "created_at": datetime.now().isoformat(),
+    "updated_at": datetime.now().isoformat(),
+  })
+  outreach_state["items"] = items[-60:]
+  save_json(STATE_FILE, state)
+  return jsonify({"ok": True, "item_id": item_id, "suggestions": suggestions})
+
+
+@app.route("/api/outreach-assist/regenerate", methods=["POST"])
+def api_outreach_assist_regenerate():
+  state = load_state()
+  payload = request.get_json(silent=True) or {}
+  item_id = str(payload.get("id") or "").strip()
+  items = ((state.get("outreach_assist") or {}).get("items") or [])
+  for item in items:
+    if str(item.get("id") or "") != item_id:
+      continue
+    item["suggestions"] = _build_outreach_suggestions(
+      str(item.get("platform") or "instagram"),
+      str(item.get("creator_handle") or ""),
+      str(item.get("post_caption") or ""),
+      str(item.get("theme") or ""),
+      str(item.get("note") or ""),
+    )
+    item["updated_at"] = datetime.now().isoformat()
+    save_json(STATE_FILE, state)
+    return jsonify({"ok": True, "suggestions": item["suggestions"]})
+  return jsonify({"ok": False, "error": "Eintrag nicht gefunden."}), 404
+
+
+@app.route("/api/outreach-assist/mark", methods=["POST"])
+def api_outreach_assist_mark():
+  state = load_state()
+  payload = request.get_json(silent=True) or {}
+  item_id = str(payload.get("id") or "").strip()
+  status = str(payload.get("status") or "pending").strip().lower()
+  selected_comment = str(payload.get("selected_comment") or "").strip()
+  if status not in {"pending", "used", "skipped"}:
+    return jsonify({"ok": False, "error": "Ungueltiger Status."}), 400
+
+  items = ((state.get("outreach_assist") or {}).get("items") or [])
+  for item in items:
+    if str(item.get("id") or "") != item_id:
+      continue
+    item["status"] = status
+    item["selected_comment"] = selected_comment
+    item["updated_at"] = datetime.now().isoformat()
+    save_json(STATE_FILE, state)
+    return jsonify({"ok": True})
+  return jsonify({"ok": False, "error": "Eintrag nicht gefunden."}), 404
+
+
+@app.route("/api/instagram/monitor")
+def api_instagram_monitor():
+    force_refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
+    return jsonify(build_instagram_monitor_payload(force_refresh=force_refresh))
 
 
 @app.route("/api/state/clear-caption-cache", methods=["POST"])
@@ -1028,6 +1621,7 @@ def api_reels_delete():
   except Exception:
     pass
   state["generated_reels"] = updated_reels
+  prune_generated_reels(state, load_json(CONFIG_FILE, {}), keep_last=20)
   save_json(STATE_FILE, state)
   return jsonify({"ok": True})
 
@@ -1115,6 +1709,7 @@ def api_reels_generate_now():
   control = get_reel_control(state)
   clear_reel_preview(control)
   clear_reel_plan(control)
+  prune_generated_reels(state, cfg, keep_last=20)
   save_json(STATE_FILE, state)
   return jsonify({
     "ok": True,
@@ -1143,17 +1738,91 @@ def api_images():
     images     = get_images(folder, extensions)
     cycle_posted = get_posted_names(state)
     next_image = state.get("next_image")
+    resolved_context = resolve_dashboard_campaign_context(cfg, state)
+    active_theme = str(resolved_context.get("active_theme") or "").strip().lower()
+    theme_separator = str(((cfg.get("campaigns") or {}).get("theme_separator")) or "_").strip() or "_"
+    pinned_next_image = str(((state.get("queue_state") or {}).get("pinned_next_image")) or "").strip()
 
     result = []
     for i, img in enumerate(images):
+        theme = infer_dashboard_image_theme(img.name, separator=theme_separator)
+        meta = (state.get("image_registry") or {}).get(img.name, {}) or {}
         result.append({
             "name":   img.name,
             "index":  i,
             "status": "posted"  if img.name in cycle_posted else
                       "next"    if img.name == next_image else
                       "pending",
+            "theme": theme,
+            "matches_active_theme": bool(active_theme and theme == active_theme),
+            "quality_score": int(meta.get("quality_score", 0) or 0),
+            "duplicate_of": str(meta.get("duplicate_of") or "").strip(),
+            "pinned": img.name == pinned_next_image,
+            "posted_at": str(meta.get("posted_at") or ""),
         })
     return jsonify(result)
+
+
+@app.route("/api/images/pin-next", methods=["POST"])
+def api_pin_next_image():
+    payload = request.get_json(silent=True) or {}
+    filename = str(payload.get("filename") or "").strip()
+    state = load_state()
+    cfg = load_json(CONFIG_FILE, {})
+    images = get_images(
+      cfg.get("images_folder", ""),
+      cfg.get("supported_extensions", [".jpg", ".jpeg", ".png", ".gif", ".webp"]),
+    )
+    available_names = {image.name for image in images}
+    history = PostHistory(STATE_FILE)
+
+    if not filename:
+      history.clear_pinned_next_image(state)
+      save_json(STATE_FILE, state)
+      return jsonify({"ok": True, "msg": "Pin entfernt.", "pinned_next_image": None})
+
+    if filename not in available_names:
+      return jsonify({"ok": False, "msg": "Bild nicht gefunden."}), 404
+
+    history.set_pinned_next_image(state, filename)
+    state["next_image"] = filename
+    save_json(STATE_FILE, state)
+    return jsonify({"ok": True, "msg": f"{filename} wurde als nächstes Bild gepinnt.", "pinned_next_image": filename})
+
+
+@app.route("/api/campaign/activate", methods=["POST"])
+def api_activate_campaign():
+    payload = request.get_json(silent=True) or {}
+    campaign_name = str(payload.get("campaign_name") or "").strip()
+    cfg = load_json(CONFIG_FILE, {})
+    state = load_state()
+    valid_names = {
+      str(item.get("name") or "").strip()
+      for item in ((cfg.get("campaigns") or {}).get("campaigns", []) or [])
+      if isinstance(item, dict)
+    }
+    if campaign_name and campaign_name not in valid_names:
+      return jsonify({"ok": False, "msg": "Kampagne nicht gefunden."}), 404
+
+    state.setdefault("campaign_state", {})["campaign_override"] = campaign_name or None
+    if campaign_name:
+      state["campaign_state"]["active_campaign"] = campaign_name
+      campaign_items = [item for item in ((cfg.get("campaigns") or {}).get("campaigns", []) or []) if str(item.get("name") or "") == campaign_name]
+      if campaign_items:
+        themes = [str(theme).strip() for theme in campaign_items[0].get("themes", []) if str(theme).strip()]
+        days_per_theme = max(1, int(campaign_items[0].get("days_per_theme", (cfg.get("campaigns") or {}).get("default_days_per_theme", 2)) or 2))
+        if themes:
+          state["campaign_state"]["active_theme"] = themes[((datetime.now().date().toordinal()) // days_per_theme) % len(themes)]
+    else:
+      state["campaign_state"]["active_campaign"] = None
+      state["campaign_state"]["active_theme"] = None
+    state["campaign_state"]["last_updated_at"] = datetime.now().isoformat()
+    save_json(STATE_FILE, state)
+    return jsonify({
+      "ok": True,
+      "msg": f"Kampagnen-Override gesetzt: {campaign_name}" if campaign_name else "Kampagnen-Override entfernt.",
+      "campaign": build_campaign_overview(cfg, state),
+    })
 
 
 @app.route("/api/images/remove", methods=["POST"])
@@ -1182,6 +1851,7 @@ def api_remove_image():
     state["cycle_posted"] = [name for name in state.get("cycle_posted", []) if name != filename]
     if state.get("next_image") == filename:
         state["next_image"] = None
+    PostHistory(STATE_FILE).clear_pinned_next_image(state, filename)
 
     images = get_images(cfg.get("images_folder", ""), cfg.get("supported_extensions", [".jpg", ".jpeg", ".png", ".gif", ".webp"]))
     refresh_next_image_after_change(state, cfg, images, removed_name=filename)
@@ -1220,6 +1890,7 @@ def api_skip_next_image():
         return jsonify({"ok": False, "msg": "Kein alternatives Bild zum Überspringen verfügbar."}), 400
 
     state["next_image"] = next_choice
+    PostHistory(STATE_FILE).clear_pinned_next_image(state, current_next)
     save_json(STATE_FILE, state)
     return jsonify({
         "ok": True,
@@ -1250,11 +1921,37 @@ def api_source_thumbnail(filename):
   return send_file(build_image_path_for_reel_source(filename))
 
 
+@app.route("/public-media/<path:filename>")
+@app.route("/ig-tmp/<path:filename>")
+def public_media(filename):
+  from config import load_settings
+
+  settings = load_settings()
+  staging_folder = settings.instagram.staging_folder.resolve()
+  target = (staging_folder / filename).resolve()
+  if not str(target).startswith(str(staging_folder)):
+    abort(403)
+  if not target.exists() or not target.is_file():
+    abort(404)
+  response = send_file(target)
+  response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
+  response.headers["Cache-Control"] = "private, max-age=300"
+  return response
+
+
 @app.route("/api/poster/start", methods=["POST"])
 def api_poster_start():
   global _poster_proc
   if poster_running():
     return jsonify({"ok": False, "msg": "Poster läuft bereits."})
+
+  service_name = _poster_systemd_service()
+  if service_name:
+    result = _run_systemctl("start", service_name)
+    if result.returncode != 0:
+      message = (result.stderr or result.stdout or "systemd-Start fehlgeschlagen.").strip()
+      return jsonify({"ok": False, "msg": message}), 500
+    return jsonify({"ok": True, "msg": "Poster über systemd gestartet."})
 
   with _poster_lock:
     _poster_proc = subprocess.Popen(
@@ -1268,6 +1965,16 @@ def api_poster_start():
 @app.route("/api/poster/stop", methods=["POST"])
 def api_poster_stop():
     global _poster_proc
+    service_name = _poster_systemd_service()
+    if service_name:
+        result = _run_systemctl("stop", service_name)
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "systemd-Stopp fehlgeschlagen.").strip()
+            return jsonify({"ok": False, "msg": message}), 500
+        with _poster_lock:
+            _poster_proc = None
+        return jsonify({"ok": True, "msg": "Poster über systemd gestoppt."})
+
     processes = list_poster_processes()
     if not processes:
         return jsonify({"ok": False, "msg": "Poster lief nicht."})
@@ -1449,14 +2156,30 @@ HTML = r"""<!DOCTYPE html>
     background: rgba(255,255,255,.02);
   }
   .queue-item:hover { background: rgba(255,255,255,.05); }
+  .queue-item.campaign-match {
+    background: rgba(34,197,94,.06);
+    box-shadow: inset 3px 0 0 rgba(34,197,94,.65);
+  }
   .queue-thumb {
     width: 40px; height: 40px; border-radius: 6px; object-fit: cover; flex-shrink: 0; background: #111;
     cursor: zoom-in;
   }
   .queue-info { flex: 1; min-width: 0; }
   .queue-name { font-size: .8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .queue-submeta { font-size: .7rem; color: var(--muted); margin-top: 3px; }
   .queue-idx  { font-size: .7rem; color: var(--muted); }
   .queue-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .badge-theme { background: rgba(34,197,94,.15); color: #86efac; }
+  .btn-icon.active-filter {
+    border-color: rgba(34,197,94,.45);
+    color: #86efac;
+    background: rgba(34,197,94,.08);
+  }
+  .toolbar-select {
+    background: rgba(255,255,255,.04); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 6px 10px; font-size: .75rem;
+  }
+  .toolbar-note { font-size: .72rem; color: var(--muted); }
 
   .btn-icon {
     background: transparent; border: 1px solid var(--border); color: var(--text);
@@ -1609,7 +2332,59 @@ HTML = r"""<!DOCTYPE html>
     padding: 10px 14px; border-radius: 8px; font-size: .82rem; margin-bottom: 14px;
     border: 1px solid rgba(34,197,94,.3); background: rgba(34,197,94,.06); color: #86efac;
   }
+  .analytics-pill-row { display: flex; flex-wrap: wrap; gap: 10px; }
+  .analytics-pill {
+    flex: 1 1 140px; min-width: 140px; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid var(--border); background: rgba(255,255,255,.03);
+  }
+  .analytics-pill strong { display: block; font-size: .95rem; color: var(--text); }
+  .analytics-pill span { display: block; margin-top: 4px; font-size: .76rem; color: var(--muted); }
   .analytics-no-data { font-size: .8rem; color: var(--muted); padding: 8px 0; }
+  .analytics-meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+  @media (max-width: 800px) { .analytics-meta-grid { grid-template-columns: 1fr; } }
+  .analytics-meta-card {
+    border: 1px solid var(--border); border-radius: 12px; padding: 14px;
+    background: rgba(255,255,255,.03);
+  }
+  .analytics-meta-line { font-size: .8rem; color: var(--muted); line-height: 1.6; }
+  .analytics-meta-line strong { color: var(--text); }
+  .analytics-source-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .analytics-source-pill {
+    padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border);
+    background: rgba(255,255,255,.04); font-size: .74rem; color: var(--text);
+  }
+  .outreach-form {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px;
+  }
+  .outreach-field { display: grid; gap: 6px; }
+  .outreach-field.full { grid-column: 1 / -1; }
+  .outreach-label { font-size: .75rem; color: var(--muted); }
+  .outreach-input, .outreach-textarea, .outreach-select {
+    background: rgba(255,255,255,.04); border: 1px solid var(--border); color: var(--text);
+    border-radius: 10px; padding: 10px 12px; font-size: .82rem; width: 100%;
+  }
+  .outreach-textarea { min-height: 88px; resize: vertical; }
+  .outreach-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .outreach-list { display: grid; gap: 12px; }
+  .outreach-item {
+    border: 1px solid var(--border); border-radius: 14px; padding: 14px; background: rgba(255,255,255,.03);
+  }
+  .outreach-head, .outreach-meta, .outreach-item-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .outreach-head { justify-content: space-between; margin-bottom: 8px; }
+  .outreach-title { font-size: .88rem; font-weight: 700; }
+  .outreach-meta { font-size: .74rem; color: var(--muted); margin-bottom: 10px; }
+  .outreach-notes { font-size: .78rem; color: var(--muted); margin: 8px 0; line-height: 1.5; }
+  .outreach-suggestions { display: grid; gap: 8px; margin-top: 10px; }
+  .outreach-suggestion {
+    border: 1px solid rgba(148,163,184,.18); border-radius: 10px; padding: 10px 12px; background: rgba(15,23,42,.65);
+  }
+  .outreach-suggestion-text { font-size: .82rem; line-height: 1.5; }
+  .outreach-item-actions { margin-top: 10px; }
+  .badge-used { background: rgba(34,197,94,.15); color: #86efac; }
+  .badge-skipped { background: rgba(245,158,11,.15); color: #fcd34d; }
+  @media (max-width: 800px) {
+    .outreach-form { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -1619,6 +2394,7 @@ HTML = r"""<!DOCTYPE html>
   <div style="display:flex;align-items:center;gap:12px;">
     <span id="dry-badge"></span>
     <span><span class="status-dot" id="dot"></span><span id="status-text">Lädt…</span></span>
+    <button class="btn btn-refresh" onclick="window.open('/instagram', '_blank', 'noopener')">Instagram</button>
     <button class="btn btn-refresh" onclick="window.open('/reels', '_blank', 'noopener')">Reels</button>
     <button class="btn btn-refresh" onclick="window.open('/music', '_blank', 'noopener')">Musik</button>
     <button class="btn btn-start"    id="btn-start"   onclick="posterAction('start')">Starten</button>
@@ -1646,6 +2422,14 @@ HTML = r"""<!DOCTYPE html>
     <div class="kpi">
       <div class="kpi-label">Plattform</div>
       <div class="kpi-value" id="kpi-platform">–</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Kommentar-Cache</div>
+      <div class="kpi-value" id="kpi-comment-cache">–</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Ollama-Kommentare</div>
+      <div class="kpi-value" id="kpi-comment-ollama">–</div>
     </div>
   </div>
 
@@ -1681,7 +2465,19 @@ HTML = r"""<!DOCTYPE html>
 
     <!-- Warteschlange -->
     <div class="card">
-      <div class="card-header">Bilderwarteschlange</div>
+      <div class="card-header">Bilderwarteschlange
+        <div class="toolbar-actions">
+          <span class="toolbar-note" id="queue-counter">0 von 0 sichtbar</span>
+          <select class="toolbar-select" id="queue-sort-select" onchange="changeQueueSort(this.value)">
+            <option value="campaign">Sort: Kampagne</option>
+            <option value="theme">Sort: Thema</option>
+            <option value="unposted">Sort: Ungepostet zuerst</option>
+            <option value="recent">Sort: Zuletzt genutzt</option>
+          </select>
+          <button class="btn-icon" id="queue-theme-filter-btn" onclick="toggleQueueThemeFilter()">Nur aktives Thema</button>
+          <button class="btn-icon" id="queue-unposted-filter-btn" onclick="toggleQueueUnpostedFilter()">Nur ungepostete</button>
+        </div>
+      </div>
       <div class="card-body" style="padding:12px;">
         <div class="queue" id="queue-list">Lädt…</div>
       </div>
@@ -1751,6 +2547,26 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div class="card-body" style="padding:16px;">
       <div id="analytics-engagement-status"></div>
+      <div class="analytics-meta-grid">
+        <div>
+          <div class="analytics-section-title">Aktive Kampagne</div>
+          <div id="analytics-campaign"><div class="analytics-no-data">Noch keine Kampagnen-Daten</div></div>
+        </div>
+        <div>
+          <div class="analytics-section-title">Aktive Smart Slots</div>
+          <div id="analytics-smart-slots"><div class="analytics-no-data">Noch keine Slot-Daten</div></div>
+        </div>
+      </div>
+      <div class="analytics-grid">
+        <div>
+          <div class="analytics-section-title">Engagement-Alerts</div>
+          <div id="analytics-alerts"><div class="analytics-no-data">Noch keine Alerts</div></div>
+        </div>
+        <div>
+          <div class="analytics-section-title">Recycle-Queue</div>
+          <div id="analytics-recycle"><div class="analytics-no-data">Noch keine Recycle-Kandidaten</div></div>
+        </div>
+      </div>
       <div class="analytics-grid">
         <div>
           <div class="analytics-section-title">Top-Hashtags nach Engagement</div>
@@ -1761,9 +2577,84 @@ HTML = r"""<!DOCTYPE html>
           <div id="analytics-weekday"><div class="analytics-no-data">Noch keine Daten</div></div>
         </div>
       </div>
+      <div class="analytics-grid">
+        <div>
+          <div class="analytics-section-title">Starke Hook-Starts</div>
+          <div id="analytics-hooks"><div class="analytics-no-data">Noch keine Hook-Daten</div></div>
+        </div>
+        <div>
+          <div class="analytics-section-title">Starke CTA-Abschlüsse</div>
+          <div id="analytics-ctas"><div class="analytics-no-data">Noch keine CTA-Daten</div></div>
+        </div>
+      </div>
+      <div class="analytics-grid">
+        <div>
+          <div class="analytics-section-title">Format-Performance</div>
+          <div id="analytics-formats"><div class="analytics-no-data">Noch keine Format-Daten</div></div>
+        </div>
+        <div>
+          <div class="analytics-section-title">Top-Performer</div>
+          <div id="analytics-top-posts"><div class="analytics-no-data">Noch keine Top-Posts</div></div>
+        </div>
+      </div>
+      <div>
+        <div class="analytics-section-title">Auto-Kommentar-Engine</div>
+        <div id="analytics-auto-comments"><div class="analytics-no-data">Noch keine Daten zur Kommentar-Engine</div></div>
+      </div>
       <div>
         <div class="analytics-section-title">Caption-Lerngewichte <span id="analytics-weights-data-hint" style="font-weight:400;text-transform:none;letter-spacing:0;"></span></div>
         <div id="analytics-weights"><div class="analytics-no-data">Noch keine Engagement-Daten (mind. 3 Posts)</div></div>
+      </div>
+      <div style="margin-top:18px;">
+        <div class="analytics-section-title">Caption A/B Tests</div>
+        <div id="analytics-caption-experiments"><div class="analytics-no-data">Noch keine A/B-Test-Daten</div></div>
+      </div>
+      <div style="margin-top:18px;">
+        <div class="analytics-section-title">Content-Qualität & Duplicates</div>
+        <div id="analytics-content-quality"><div class="analytics-no-data">Noch keine Qualitätsdaten</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">Comment Assist</div>
+    <div class="card-body" style="padding:16px;">
+      <div class="outreach-form">
+        <div class="outreach-field">
+          <label class="outreach-label" for="outreach-platform">Plattform</label>
+          <select id="outreach-platform" class="outreach-select">
+            <option value="instagram">Instagram</option>
+            <option value="facebook">Facebook</option>
+            <option value="tiktok">TikTok</option>
+          </select>
+        </div>
+        <div class="outreach-field">
+          <label class="outreach-label" for="outreach-handle">Handle / Account</label>
+          <input id="outreach-handle" class="outreach-input" placeholder="@accountname">
+        </div>
+        <div class="outreach-field">
+          <label class="outreach-label" for="outreach-theme">Thema</label>
+          <input id="outreach-theme" class="outreach-input" placeholder="z. B. cyberpunk, portrait, sci-fi">
+        </div>
+        <div class="outreach-field">
+          <label class="outreach-label" for="outreach-url">Post-URL optional</label>
+          <input id="outreach-url" class="outreach-input" placeholder="https://...">
+        </div>
+        <div class="outreach-field full">
+          <label class="outreach-label" for="outreach-caption">Kurztext zum Fremdpost</label>
+          <textarea id="outreach-caption" class="outreach-textarea" placeholder="Worum geht es im Post, was faellt auf, welche Stimmung hat er?"></textarea>
+        </div>
+        <div class="outreach-field full">
+          <label class="outreach-label" for="outreach-note">Notiz optional</label>
+          <input id="outreach-note" class="outreach-input" placeholder="z. B. starkes Licht, gute Komposition, neues Profil">
+        </div>
+      </div>
+      <div class="outreach-actions">
+        <button class="btn-icon" onclick="createOutreachSuggestion()">Vorschlaege erzeugen</button>
+        <div id="outreach-summary" class="toolbar-note">Noch keine Outreach-Eintraege</div>
+      </div>
+      <div id="outreach-list" class="outreach-list" style="margin-top:16px;">
+        <div class="analytics-no-data">Noch keine Comment-Assist-Eintraege</div>
       </div>
     </div>
   </div>
@@ -1821,6 +2712,9 @@ HTML = r"""<!DOCTYPE html>
 <script>
 let currentStatus = {};
 let queueItems = [];
+let queueFilterActiveThemeOnly = false;
+let queueFilterUnpostedOnly = false;
+let queueSortMode = 'campaign';
 let selectedImage = null;
 let currentReelStatus = {};
 let selectedReelPath = null;
@@ -1861,6 +2755,8 @@ async function fetchStatus() {
     ? currentStatus.posting_slots.join(' / ')
     : '–';
   document.getElementById('kpi-platform').textContent = currentStatus.platform ?? '–';
+  document.getElementById('kpi-comment-cache').textContent = currentStatus.auto_comment?.cache_size ?? '–';
+  document.getElementById('kpi-comment-ollama').textContent = currentStatus.auto_comment?.ollama_used ?? '–';
 
   document.getElementById('next-time').textContent =
     currentStatus.next_post_time ? 'Nächster Post: ' + currentStatus.next_post_time : '';
@@ -1898,6 +2794,171 @@ async function fetchStatus() {
   document.getElementById('skip-next-top').disabled = !currentStatus.next_image;
 }
 
+function renderCampaignOverview(campaign) {
+  const el = document.getElementById('analytics-campaign');
+  if (!campaign || !campaign.enabled) {
+    el.innerHTML = '<div class="analytics-no-data">Kampagnenmodus ist deaktiviert</div>';
+    return;
+  }
+  const configured = Array.isArray(campaign.configured_campaigns) ? campaign.configured_campaigns : [];
+  const themeCounts = campaign.theme_post_counts || {};
+  const activeThemePosts = campaign.active_theme ? (themeCounts[campaign.active_theme] || 0) : 0;
+  const sourceList = configured.length
+    ? `<div class="analytics-source-list">${configured.slice(0, 6).map(item =>
+        `<span class="analytics-source-pill">${escapeHtml(item.name || 'Ohne Namen')}: ${escapeHtml((item.themes || []).join(', ') || '–')}</span>`
+      ).join('')}</div>`
+    : '';
+  const campaignOptions = configured.length
+    ? `<div class="toolbar-actions" style="margin:10px 0 0;">
+        <select class="toolbar-select" id="campaign-select" onchange="setCampaignOverride(this.value)">
+          <option value="">Auto / kein Override</option>
+          ${configured.map(item => `<option value="${escapeHtml(item.name)}" ${item.name === (campaign.override_campaign || '') ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}
+        </select>
+      </div>`
+    : '';
+  const progressPills = configured.length
+    ? `<div class="analytics-source-list">${configured.slice(0, 4).map(item => {
+        const targets = item.targets || {};
+        const progress = item.progress || {};
+        return `<span class="analytics-source-pill">${escapeHtml(item.name)} · Feed ${progress.feed_posts || 0}/${targets.feed_posts || 0} · Stories ${progress.stories || 0}/${targets.stories || 0} · Reels ${progress.reels || 0}/${targets.reels || 0}</span>`;
+      }).join('')}</div>`
+    : '';
+  const themeCalendar = Array.isArray(campaign.theme_calendar) && campaign.theme_calendar.length
+    ? `<div class="analytics-source-list">${campaign.theme_calendar.map(item =>
+        `<span class="analytics-source-pill">${escapeHtml(item.date)} · ${escapeHtml(item.theme || '–')}</span>`
+      ).join('')}</div>`
+    : '';
+  el.innerHTML = `
+    <div class="analytics-meta-card">
+      <div class="analytics-meta-line"><strong>Kampagne:</strong> ${escapeHtml(campaign.active_campaign || 'Auto-Serie / keine feste Kampagne')}</div>
+      <div class="analytics-meta-line"><strong>Override:</strong> ${escapeHtml(campaign.override_campaign || 'kein Override')}</div>
+      <div class="analytics-meta-line"><strong>Thema:</strong> ${escapeHtml(campaign.active_theme || 'kein aktives Thema')}</div>
+      <div class="analytics-meta-line"><strong>Posts im aktiven Thema:</strong> ${activeThemePosts}</div>
+      <div class="analytics-meta-line"><strong>Fallback auf erkannte Themen:</strong> ${campaign.fallback_to_detected_themes ? 'aktiv' : 'aus'}</div>
+      ${campaign.last_updated_at ? `<div class="analytics-meta-line"><strong>Zuletzt aktualisiert:</strong> ${escapeHtml(new Date(campaign.last_updated_at).toLocaleString('de-DE'))}</div>` : ''}
+      ${campaignOptions}
+      ${sourceList}
+      ${progressPills}
+      ${themeCalendar}
+    </div>`;
+}
+
+function renderSmartSlotOverview(smartSlots) {
+  const el = document.getElementById('analytics-smart-slots');
+  if (!smartSlots || !smartSlots.enabled) {
+    el.innerHTML = '<div class="analytics-no-data">Smart Slots sind deaktiviert</div>';
+    return;
+  }
+  const slots = Array.isArray(smartSlots.last_applied_slots) ? smartSlots.last_applied_slots : [];
+  const sources = smartSlots.last_sources || {};
+  if (!slots.length) {
+    el.innerHTML = '<div class="analytics-no-data">Noch keine aktiven Smart-Slot-Entscheidungen gespeichert</div>';
+    return;
+  }
+  el.innerHTML = `
+    <div class="analytics-meta-card">
+      <div class="analytics-meta-line"><strong>Exploration:</strong> ${Math.round((smartSlots.exploration_rate || 0) * 100)}%</div>
+      ${smartSlots.last_updated_at ? `<div class="analytics-meta-line"><strong>Zuletzt berechnet:</strong> ${escapeHtml(new Date(smartSlots.last_updated_at).toLocaleString('de-DE'))}</div>` : ''}
+      <div class="analytics-source-list">${slots.map(slot =>
+        `<span class="analytics-source-pill">${escapeHtml(slot)} · ${escapeHtml(sources[slot] || 'historical')}</span>`
+      ).join('')}</div>
+    </div>`;
+}
+
+function renderCaptionExperiments(experiments) {
+  const el = document.getElementById('analytics-caption-experiments');
+  if (!experiments || !experiments.enabled) {
+    el.innerHTML = '<div class="analytics-no-data">Caption-A/B-Tests sind deaktiviert</div>';
+    return;
+  }
+  const hookWeights = Object.entries(experiments.hook_weights || {});
+  const ctaWeights = Object.entries(experiments.cta_weights || {});
+  const hookCounts = experiments.hook_counts || {};
+  const ctaCounts = experiments.cta_counts || {};
+  if (!hookWeights.length && !ctaWeights.length) {
+    el.innerHTML = '<div class="analytics-no-data">Noch keine ausreichenden A/B-Test-Daten</div>';
+    return;
+  }
+  const renderRows = (entries, counts, labelPrefix) => {
+    const maxWeight = Math.max(...entries.map(([, weight]) => Number(weight) || 1), 1);
+    return entries.sort((a, b) => Number(b[1]) - Number(a[1])).map(([label, weight]) => {
+      const pct = Math.round(Math.min(((Number(weight) || 1) / Math.max(maxWeight, 1.5)) * 100, 100));
+      const color = Number(weight) > 1.08 ? 'green' : Number(weight) >= 0.95 ? 'yellow' : 'red';
+      return `<div class="analytics-bar-row">
+        <div class="analytics-bar-label">${escapeHtml(labelPrefix + ': ' + label)}</div>
+        <div class="analytics-bar-track"><div class="analytics-bar-fill ${color}" style="width:${pct}%"></div></div>
+        <div class="analytics-bar-val">${Number(weight).toFixed(2)}x · ${counts[label] || 0}</div>
+      </div>`;
+    }).join('');
+  };
+  const winners = experiments.winners || {};
+  const winnerBlock = `
+    <div class="analytics-meta-card" style="margin-bottom:12px;">
+      <div class="analytics-meta-line"><strong>Gewinner Bildposts:</strong> Hook ${escapeHtml(winners.image?.hook_style || '–')} (${Number(winners.image?.hook_weight || 1).toFixed(2)}x) · CTA ${escapeHtml(winners.image?.cta_style || '–')} (${Number(winners.image?.cta_weight || 1).toFixed(2)}x)</div>
+      <div class="analytics-meta-line"><strong>Gewinner Reels:</strong> Hook ${escapeHtml(winners.reel?.hook_style || '–')} (${Number(winners.reel?.hook_weight || 1).toFixed(2)}x) · CTA ${escapeHtml(winners.reel?.cta_style || '–')} (${Number(winners.reel?.cta_weight || 1).toFixed(2)}x)</div>
+    </div>`;
+  el.innerHTML = `
+    <div class="analytics-meta-card" style="margin-bottom:12px;">
+      <div class="analytics-meta-line"><strong>Exploration:</strong> ${Math.round((experiments.exploration_rate || 0) * 100)}%</div>
+      <div class="analytics-meta-line"><strong>Messung:</strong> Gewichte über Hook- und CTA-Stile mit Engagement-Rückfluss</div>
+    </div>
+    ${winnerBlock}
+    <div class="analytics-grid">
+      <div>
+        <div class="analytics-section-title">Hook-Stile</div>
+        ${renderRows(hookWeights, hookCounts, 'Hook')}
+      </div>
+      <div>
+        <div class="analytics-section-title">CTA-Stile</div>
+        ${renderRows(ctaWeights, ctaCounts, 'CTA')}
+      </div>
+    </div>`;
+}
+
+function renderEngagementActions(actions) {
+  const alertsEl = document.getElementById('analytics-alerts');
+  const recycleEl = document.getElementById('analytics-recycle');
+  const alerts = Array.isArray(actions?.alerts) ? actions.alerts : [];
+  const recycle = Array.isArray(actions?.recycle_queue) ? actions.recycle_queue : [];
+  alertsEl.innerHTML = alerts.length
+    ? `<table class="analytics-hashtag-table"><thead><tr><th>Zeit</th><th>Typ</th><th>Meldung</th><th>Score</th></tr></thead><tbody>${alerts.map(item => `
+      <tr><td style="color:var(--muted)">${escapeHtml(item.time ? new Date(item.time).toLocaleString('de-DE') : '–')}</td><td>${escapeHtml(item.type || '–')}</td><td>${escapeHtml(item.message || '')}</td><td style="color:var(--muted)">${escapeHtml(item.score ?? '–')}</td></tr>
+    `).join('')}</tbody></table>`
+    : '<div class="analytics-no-data">Noch keine Alerts</div>';
+  recycleEl.innerHTML = recycle.length
+    ? `<table class="analytics-hashtag-table"><thead><tr><th>Post</th><th>Format</th><th>Status</th><th>Fällig</th></tr></thead><tbody>${recycle.map(item => `
+      <tr><td title="${escapeHtml(item.file || '')}">${escapeHtml(item.file || '–')}</td><td>${escapeHtml((item.formats || []).join(', ') || '–')}</td><td>${escapeHtml(item.status || 'queued')}</td><td style="color:var(--muted)">${escapeHtml(item.due_at ? new Date(item.due_at).toLocaleString('de-DE') : '–')}</td></tr>
+    `).join('')}</tbody></table>`
+    : '<div class="analytics-no-data">Noch keine Recycle-Kandidaten</div>';
+}
+
+function renderContentQualityOverview(quality) {
+  const el = document.getElementById('analytics-content-quality');
+  const diagnostics = Array.isArray(quality?.diagnostics) ? quality.diagnostics : [];
+  const duplicates = Array.isArray(quality?.duplicates) ? quality.duplicates : [];
+  const lowestQuality = Array.isArray(quality?.lowest_quality) ? quality.lowest_quality : [];
+  if (!diagnostics.length && !duplicates.length && !lowestQuality.length) {
+    el.innerHTML = '<div class="analytics-no-data">Noch keine Qualitätsdaten</div>';
+    return;
+  }
+  el.innerHTML = `
+    <div class="analytics-meta-card" style="margin-bottom:12px;">
+      ${quality?.last_scan_at ? `<div class="analytics-meta-line"><strong>Letzter Scan:</strong> ${escapeHtml(new Date(quality.last_scan_at).toLocaleString('de-DE'))}</div>` : ''}
+      <div class="analytics-meta-line"><strong>Ähnliche Bilder:</strong> ${duplicates.length}</div>
+      <div class="analytics-meta-line"><strong>Aktuelle Hinweise:</strong> ${diagnostics.length}</div>
+    </div>
+    <div class="analytics-grid">
+      <div>
+        <div class="analytics-section-title">Niedrige Qualität</div>
+        ${lowestQuality.length ? lowestQuality.map(item => `<div class="analytics-bar-row"><div class="analytics-bar-label">${escapeHtml(item.file)}</div><div class="analytics-bar-track"><div class="analytics-bar-fill red" style="width:${Math.max(6, item.quality_score)}%"></div></div><div class="analytics-bar-val">${item.quality_score}</div></div>`).join('') : '<div class="analytics-no-data">Keine Daten</div>'}
+      </div>
+      <div>
+        <div class="analytics-section-title">Diagnostics</div>
+        ${diagnostics.length ? `<table class="analytics-hashtag-table"><thead><tr><th>Datei</th><th>Grund</th></tr></thead><tbody>${diagnostics.map(item => `<tr><td>${escapeHtml(item.file || '–')}</td><td style="color:var(--muted)">${escapeHtml(item.reason || '–')}</td></tr>`).join('')}</tbody></table>` : '<div class="analytics-no-data">Keine Diagnostics</div>'}
+      </div>
+    </div>`;
+}
+
 async function fetchHistory() {
   const r    = await fetch('/api/history');
   const data = await r.json();
@@ -1925,23 +2986,96 @@ async function fetchQueue() {
   const r    = await fetch('/api/images');
   const data = await r.json();
   queueItems = data;
+  renderQueue();
+}
+
+function renderQueue() {
   const el   = document.getElementById('queue-list');
-  if (!data.length) {
+  const filterButton = document.getElementById('queue-theme-filter-btn');
+  const unpostedButton = document.getElementById('queue-unposted-filter-btn');
+  const sortSelect = document.getElementById('queue-sort-select');
+  const counter = document.getElementById('queue-counter');
+  const activeTheme = currentStatus.campaign?.active_theme || '';
+  if (filterButton) {
+    filterButton.classList.toggle('active-filter', queueFilterActiveThemeOnly);
+    filterButton.textContent = queueFilterActiveThemeOnly
+      ? 'Filter: aktives Thema'
+      : 'Nur aktives Thema';
+    filterButton.disabled = !activeTheme;
+  }
+  if (unpostedButton) {
+    unpostedButton.classList.toggle('active-filter', queueFilterUnpostedOnly);
+    unpostedButton.textContent = queueFilterUnpostedOnly
+      ? 'Filter: ungepostet'
+      : 'Nur ungepostete';
+  }
+  if (sortSelect) {
+    sortSelect.value = queueSortMode;
+  }
+
+  let visibleItems = queueItems;
+  if (queueFilterActiveThemeOnly && activeTheme) {
+    visibleItems = visibleItems.filter(item => item.matches_active_theme);
+  }
+  if (queueFilterUnpostedOnly) {
+    visibleItems = visibleItems.filter(item => item.status !== 'posted');
+  }
+  visibleItems = [...visibleItems].sort((left, right) => {
+    if (queueSortMode === 'theme') {
+      return String(left.theme || '').localeCompare(String(right.theme || '')) || left.index - right.index;
+    }
+    if (queueSortMode === 'unposted') {
+      const leftScore = left.status === 'posted' ? 1 : 0;
+      const rightScore = right.status === 'posted' ? 1 : 0;
+      return leftScore - rightScore || left.index - right.index;
+    }
+    if (queueSortMode === 'recent') {
+      return String(right.posted_at || '').localeCompare(String(left.posted_at || '')) || left.index - right.index;
+    }
+    const leftCampaign = left.matches_active_theme ? 0 : 1;
+    const rightCampaign = right.matches_active_theme ? 0 : 1;
+    return leftCampaign - rightCampaign || left.index - right.index;
+  });
+  if (counter) {
+    counter.textContent = `${visibleItems.length} von ${queueItems.length} sichtbar`;
+  }
+
+  if (!queueItems.length) {
     el.innerHTML = '<div style="color:var(--muted);font-size:.82rem;padding:8px">Keine Bilder im Ordner</div>';
     return;
   }
-  el.innerHTML = data.map(img => {
+  if (!visibleItems.length) {
+    let emptyMessage = 'Keine Bilder für die aktuellen Filter gefunden';
+    if (queueFilterActiveThemeOnly && queueFilterUnpostedOnly) {
+      emptyMessage = 'Keine ungeposteten Bilder für das aktuell aktive Thema gefunden';
+    } else if (queueFilterActiveThemeOnly) {
+      emptyMessage = 'Keine Bilder für das aktuell aktive Thema gefunden';
+    } else if (queueFilterUnpostedOnly) {
+      emptyMessage = 'Keine ungeposteten Bilder gefunden';
+    }
+    el.innerHTML = `<div style="color:var(--muted);font-size:.82rem;padding:8px">${escapeHtml(emptyMessage)}</div>`;
+    return;
+  }
+
+  el.innerHTML = visibleItems.map(img => {
     const badgeMap = {
       posted:  '<span class="badge badge-posted">Gepostet</span>',
       next:    '<span class="badge badge-next">Nächstes</span>',
       pending: '<span class="badge badge-pending">Wartend</span>',
     };
+    const themeBadge = img.matches_active_theme
+      ? `<span class="badge badge-theme">Kampagne: ${escapeHtml(img.theme || activeTheme)}</span>`
+      : '';
+    const themeLine = img.theme
+      ? `<div class="queue-submeta">Thema: ${escapeHtml(img.theme)}${img.matches_active_theme ? ' · aktiv bevorzugt' : ''}</div>`
+      : '';
     const encodedName = encodeURIComponent(img.name);
     const statusLabel = img.status === 'next' ? 'Als Nächstes' : img.status === 'posted' ? 'Bereits gepostet' : 'Wartend';
     const skipButton = img.status === 'next'
       ? `<button class="btn-icon warn" onclick="skipNextImage(event)">Überspringen</button>`
       : '';
-    return `<div class="queue-item">
+    const pinButton = `<button class="btn-icon ${img.pinned ? 'active-filter' : ''}" onclick="pinNextImage('${encodedName}')">${img.pinned ? 'Entpinnen' : 'Pinnen'}</button>`;
+    return `<div class="queue-item ${img.matches_active_theme ? 'campaign-match' : ''}">
       <img class="queue-thumb"
            src="/api/thumbnail/${encodedName}"
            alt=""
@@ -1949,16 +3083,69 @@ async function fetchQueue() {
            onerror="this.style.visibility='hidden'">
       <div class="queue-info">
         <div class="queue-name">${escapeHtml(img.name)}</div>
+        ${themeLine}${img.quality_score ? `<div class="queue-submeta">Qualität: ${img.quality_score}${img.duplicate_of ? ` · ähnlich zu ${escapeHtml(img.duplicate_of)}` : ''}</div>` : ''}
         <div class="queue-idx">#${img.index + 1}</div>
       </div>
+      ${themeBadge}
       ${badgeMap[img.status] ?? ''}
       <div class="queue-actions">
+        ${pinButton}
         <button class="btn-icon" onclick="openImageModal('${encodedName}', '${statusLabel}')">Ansehen</button>
         ${skipButton}
         <button class="btn-icon danger" onclick="removeImage('${encodedName}')">Entfernen</button>
       </div>
     </div>`;
   }).join('');
+}
+
+function toggleQueueThemeFilter() {
+  if (!currentStatus.campaign?.active_theme) return;
+  queueFilterActiveThemeOnly = !queueFilterActiveThemeOnly;
+  renderQueue();
+}
+
+function toggleQueueUnpostedFilter() {
+  queueFilterUnpostedOnly = !queueFilterUnpostedOnly;
+  renderQueue();
+}
+
+function changeQueueSort(value) {
+  queueSortMode = value || 'campaign';
+  renderQueue();
+}
+
+async function pinNextImage(encodedName) {
+  const filename = decodeURIComponent(encodedName);
+  const item = queueItems.find(entry => entry.name === filename);
+  const payload = { filename: item?.pinned ? '' : filename };
+  const response = await fetch('/api/images/pin-next', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) {
+    alert(data.msg || 'Bild konnte nicht gepinnt werden.');
+    return;
+  }
+  await fetchStatus();
+  await fetchQueue();
+}
+
+async function setCampaignOverride(campaignName) {
+  const response = await fetch('/api/campaign/activate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ campaign_name: campaignName || '' }),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) {
+    alert(data.msg || 'Kampagne konnte nicht umgestellt werden.');
+    return;
+  }
+  await fetchStatus();
+  await fetchQueue();
+  await fetchAnalytics();
 }
 
 async function fetchLog() {
@@ -2109,6 +3296,11 @@ function setDashboardReelBusy(isBusy, message = 'Reel wird erzeugt...') {
 async function fetchAnalytics() {
   const r = await fetch('/api/analytics');
   const data = await r.json();
+  renderCampaignOverview(data.campaign);
+  renderSmartSlotOverview(data.smart_slots);
+  renderCaptionExperiments(data.caption_experiments);
+  renderEngagementActions(data.engagement_actions);
+  renderContentQualityOverview(data.content_quality);
 
   // Engagement trend alert
   const statusEl = document.getElementById('analytics-engagement-status');
@@ -2142,6 +3334,31 @@ async function fetchAnalytics() {
     hashEl.innerHTML = '<div class="analytics-no-data">Noch keine Hashtag-Daten</div>';
   }
 
+  const commentEl = document.getElementById('analytics-auto-comments');
+  const commentData = data.auto_comment || {};
+  const recentComments = Array.isArray(commentData.recent) ? commentData.recent : [];
+  if (!commentData.template_used && !commentData.ollama_used && !recentComments.length) {
+    commentEl.innerHTML = '<div class="analytics-no-data">Noch keine Daten zur Kommentar-Engine</div>';
+  } else {
+    commentEl.innerHTML = `
+      <div class="analytics-engagement-ok">
+        Templates genutzt: ${commentData.template_used ?? 0} · Ollama genutzt: ${commentData.ollama_used ?? 0} · Cache-Treffer: ${commentData.cache_hits ?? 0}<br>
+        Ollama erzeugt: ${commentData.ollama_generated ?? 0} · Ollama gefiltert: ${commentData.ollama_filtered ?? 0} · Template-Fallbacks: ${commentData.template_fallbacks ?? 0} · Cache: ${commentData.cache_size ?? 0}
+      </div>
+      ${recentComments.length ? `<table class="analytics-hashtag-table">
+        <thead><tr><th>Zeit</th><th>Quelle</th><th>Status</th><th>Text</th></tr></thead>
+        <tbody>${recentComments.map(item => `
+          <tr>
+            <td style="color:var(--muted)">${escapeHtml(item.time ? new Date(item.time).toLocaleString('de-DE') : '–')}</td>
+            <td style="color:var(--muted)">${escapeHtml(item.source || '–')}</td>
+            <td style="color:var(--muted)">${escapeHtml(item.status || '–')}</td>
+            <td>${escapeHtml(item.text || '')}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>` : ''}
+    `;
+  }
+
   // Weekday performance
   const wdEl = document.getElementById('analytics-weekday');
   const wdEntries = Object.entries(data.weekday_performance || {}).sort((a, b) => b[1] - a[1]);
@@ -2158,6 +3375,70 @@ async function fetchAnalytics() {
     }).join('');
   } else {
     wdEl.innerHTML = '<div class="analytics-no-data">Noch keine Zeitdaten</div>';
+  }
+
+  const hooksEl = document.getElementById('analytics-hooks');
+  const hookEntries = Array.isArray(data.hook_performance) ? data.hook_performance : [];
+  if (hookEntries.length) {
+    const maxHook = hookEntries[0].avg_score || 1;
+    hooksEl.innerHTML = hookEntries.map(item => {
+      const pct = Math.round((item.avg_score / maxHook) * 100);
+      const color = pct > 66 ? 'green' : pct > 33 ? 'yellow' : 'red';
+      return `<div class="analytics-bar-row">
+        <div class="analytics-bar-label" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</div>
+        <div class="analytics-bar-track"><div class="analytics-bar-fill ${color}" style="width:${pct}%"></div></div>
+        <div class="analytics-bar-val">${item.avg_score}</div>
+      </div>`;
+    }).join('');
+  } else {
+    hooksEl.innerHTML = '<div class="analytics-no-data">Noch keine Hook-Daten</div>';
+  }
+
+  const ctasEl = document.getElementById('analytics-ctas');
+  const ctaEntries = Array.isArray(data.cta_performance) ? data.cta_performance : [];
+  if (ctaEntries.length) {
+    const maxCta = ctaEntries[0].avg_score || 1;
+    ctasEl.innerHTML = ctaEntries.map(item => {
+      const pct = Math.round((item.avg_score / maxCta) * 100);
+      const color = pct > 66 ? 'green' : pct > 33 ? 'yellow' : 'red';
+      return `<div class="analytics-bar-row">
+        <div class="analytics-bar-label" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</div>
+        <div class="analytics-bar-track"><div class="analytics-bar-fill ${color}" style="width:${pct}%"></div></div>
+        <div class="analytics-bar-val">${item.avg_score}</div>
+      </div>`;
+    }).join('');
+  } else {
+    ctasEl.innerHTML = '<div class="analytics-no-data">Noch keine CTA-Daten</div>';
+  }
+
+  const formatsEl = document.getElementById('analytics-formats');
+  const formatEntries = Array.isArray(data.format_performance) ? data.format_performance : [];
+  if (formatEntries.length) {
+    formatsEl.innerHTML = `<div class="analytics-pill-row">${formatEntries.map(item => `
+      <div class="analytics-pill">
+        <strong>${escapeHtml(item.label)}</strong>
+        <span>Ø Score ${item.avg_score} · ${item.posts} Posts · Best ${item.best_score}</span>
+      </div>`).join('')}</div>`;
+  } else {
+    formatsEl.innerHTML = '<div class="analytics-no-data">Noch keine Format-Daten</div>';
+  }
+
+  const topPostsEl = document.getElementById('analytics-top-posts');
+  const topPosts = Array.isArray(data.top_posts) ? data.top_posts : [];
+  if (topPosts.length) {
+    topPostsEl.innerHTML = `<table class="analytics-hashtag-table">
+      <thead><tr><th>Format</th><th>Datei</th><th>Slot</th><th>Score</th></tr></thead>
+      <tbody>${topPosts.map(item => `
+        <tr>
+          <td style="color:var(--muted)">${escapeHtml(item.content_type === 'reel' ? 'Reel' : 'Bild')}</td>
+          <td title="${escapeHtml(item.file || '')}">${escapeHtml(item.file || '–')}</td>
+          <td style="color:var(--muted)">${escapeHtml(item.slot || '–')}</td>
+          <td style="color:var(--muted)">${item.score}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  } else {
+    topPostsEl.innerHTML = '<div class="analytics-no-data">Noch keine Top-Posts</div>';
   }
 
   // Caption feature weights
@@ -2189,6 +3470,118 @@ async function fetchAnalytics() {
   }
 }
 
+async function fetchOutreachAssist() {
+  const response = await fetch('/api/outreach-assist');
+  const data = await response.json();
+  renderOutreachAssist(data);
+}
+
+function renderOutreachAssist(data) {
+  const summaryEl = document.getElementById('outreach-summary');
+  const listEl = document.getElementById('outreach-list');
+  const items = Array.isArray(data.items) ? data.items : [];
+  summaryEl.textContent = `Offen: ${data.pending ?? 0} · Genutzt: ${data.used ?? 0} · Uebersprungen: ${data.skipped ?? 0}`;
+
+  if (!items.length) {
+    listEl.innerHTML = '<div class="analytics-no-data">Noch keine Comment-Assist-Eintraege</div>';
+    return;
+  }
+
+  listEl.innerHTML = items.map(item => {
+    const status = item.status || 'pending';
+    const badgeClass = status === 'used' ? 'badge-used' : status === 'skipped' ? 'badge-skipped' : 'badge-pending';
+    const suggestions = Array.isArray(item.suggestions) ? item.suggestions : [];
+    return `
+      <div class="outreach-item">
+        <div class="outreach-head">
+          <div class="outreach-title">${escapeHtml(item.creator_handle || 'Ohne Handle')} <span class="badge ${badgeClass}">${escapeHtml(status)}</span></div>
+          <div class="outreach-meta">${escapeHtml((item.platform || 'instagram').toUpperCase())} · ${escapeHtml(item.theme || 'ohne Thema')}</div>
+        </div>
+        <div class="outreach-notes">${escapeHtml(item.post_caption || 'Kein Fremdpost-Text hinterlegt.')}</div>
+        ${item.note ? `<div class="outreach-notes">Notiz: ${escapeHtml(item.note)}</div>` : ''}
+        ${item.selected_comment ? `<div class="outreach-notes">Genutzt: ${escapeHtml(item.selected_comment)}</div>` : ''}
+        ${item.post_url ? `<div class="outreach-meta"><a href="${escapeHtml(item.post_url)}" target="_blank" rel="noopener">Post oeffnen</a></div>` : ''}
+        <div class="outreach-suggestions">
+          ${suggestions.map(text => `
+            <div class="outreach-suggestion">
+              <div class="outreach-suggestion-text">${escapeHtml(text)}</div>
+              <div class="outreach-item-actions">
+                <button class="btn-icon" onclick="copyOutreachText(${JSON.stringify(text)})">Kopieren</button>
+                <button class="btn-icon" onclick="markOutreachStatus('${escapeHtml(item.id)}', 'used', ${JSON.stringify(text)})">Als genutzt</button>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+        <div class="outreach-item-actions">
+          <button class="btn-icon" onclick="regenerateOutreachSuggestions('${escapeHtml(item.id)}')">Neu mischen</button>
+          <button class="btn-icon warn" onclick="markOutreachStatus('${escapeHtml(item.id)}', 'skipped', '')">Ueberspringen</button>
+          <button class="btn-icon" onclick="markOutreachStatus('${escapeHtml(item.id)}', 'pending', '')">Offen lassen</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function createOutreachSuggestion() {
+  const payload = {
+    platform: document.getElementById('outreach-platform').value,
+    creator_handle: document.getElementById('outreach-handle').value.trim(),
+    theme: document.getElementById('outreach-theme').value.trim(),
+    post_url: document.getElementById('outreach-url').value.trim(),
+    post_caption: document.getElementById('outreach-caption').value.trim(),
+    note: document.getElementById('outreach-note').value.trim(),
+  };
+  const response = await fetch('/api/outreach-assist', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    alert(result.error || 'Comment-Assist konnte nicht erstellt werden.');
+    return;
+  }
+  document.getElementById('outreach-caption').value = '';
+  document.getElementById('outreach-note').value = '';
+  await fetchOutreachAssist();
+}
+
+async function regenerateOutreachSuggestions(id) {
+  const response = await fetch('/api/outreach-assist/regenerate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id }),
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    alert(result.error || 'Vorschlaege konnten nicht neu erzeugt werden.');
+    return;
+  }
+  await fetchOutreachAssist();
+}
+
+async function markOutreachStatus(id, status, selectedComment) {
+  const response = await fetch('/api/outreach-assist/mark', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, status, selected_comment: selectedComment }),
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    alert(result.error || 'Status konnte nicht gespeichert werden.');
+    return;
+  }
+  await fetchOutreachAssist();
+}
+
+async function copyOutreachText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (error) {
+    console.warn('Clipboard write failed', error);
+  }
+}
+
 async function clearCaptionCache() {
   if (!confirm('Caption-Cache leeren? Alle gespeicherten Captions werden gelöscht und beim nächsten Post neu generiert.')) return;
   const r = await fetch('/api/state/clear-caption-cache', { method: 'POST' });
@@ -2199,7 +3592,7 @@ async function clearCaptionCache() {
 
 async function refresh() {
   await fetchStatus();
-  await Promise.all([fetchHistory(), fetchQueue(), fetchLog(), fetchReels(), fetchSchedule(), fetchAnalytics()]);
+  await Promise.all([fetchHistory(), fetchQueue(), fetchLog(), fetchReels(), fetchSchedule(), fetchAnalytics(), fetchOutreachAssist()]);
 }
 
 function getImageByName(name) {
@@ -2520,6 +3913,7 @@ REELS_HTML = r"""<!DOCTYPE html>
   <h1>Auto-Poster <span>Reel Monitor</span></h1>
   <div style="display:flex;gap:10px;align-items:center;">
     <button class="btn" onclick="window.location.href='/'">Hauptdashboard</button>
+    <button class="btn" onclick="window.open('/instagram', '_blank', 'noopener')">Instagram</button>
     <button class="btn" onclick="window.open('/music', '_blank', 'noopener')">Musikbibliothek</button>
     <button class="btn" onclick="refreshReelsWindow()">Aktualisieren</button>
   </div>
@@ -3071,6 +4465,7 @@ MUSIC_HTML = r"""<!DOCTYPE html>
   <h1>Auto-Poster <span>Musikbibliothek</span></h1>
   <div class="actions">
     <button class="btn" onclick="window.location.href='/'">Hauptdashboard</button>
+    <button class="btn" onclick="window.location.href='/instagram'">Instagram</button>
     <button class="btn" onclick="window.location.href='/reels'">Reels</button>
     <button class="btn" onclick="refreshMusicLibrary()">Aktualisieren</button>
   </div>
@@ -3184,6 +4579,212 @@ setInterval(refreshMusicLibrary, 20000);
 </html>
 """
 
+INSTAGRAM_HTML = r"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Instagram Monitor</title>
+<style>
+  :root {
+    --bg: #0a0f1d;
+    --card: #131a2c;
+    --border: #24314f;
+    --accent: #f97316;
+    --accent-2: #ec4899;
+    --text: #eef2ff;
+    --muted: #94a3b8;
+    --green: #22c55e;
+    --yellow: #f59e0b;
+    --red: #ef4444;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh; color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif;
+    background:
+      radial-gradient(circle at top left, rgba(249,115,22,.12), transparent 32%),
+      radial-gradient(circle at top right, rgba(236,72,153,.10), transparent 28%),
+      var(--bg);
+  }
+  header {
+    padding: 18px 24px; display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid rgba(255,255,255,.06); background: rgba(10,15,29,.74); backdrop-filter: blur(10px);
+    position: sticky; top: 0; z-index: 50;
+  }
+  h1 { font-size: 1.1rem; letter-spacing: .04em; }
+  h1 span { color: var(--accent-2); }
+  main { padding: 24px; display: grid; gap: 18px; }
+  .actions { display:flex; gap:10px; align-items:center; }
+  .btn {
+    border: 1px solid rgba(148,163,184,.18); color: var(--text); background: transparent;
+    border-radius: 10px; padding: 8px 12px; cursor: pointer;
+  }
+  .btn:hover { border-color: var(--accent-2); }
+  .grid { display: grid; gap: 18px; grid-template-columns: 1fr 1fr; }
+  .card { background: rgba(19,26,44,.92); border: 1px solid rgba(148,163,184,.14); border-radius: var(--radius); overflow: hidden; }
+  .card-head {
+    padding: 14px 18px; border-bottom: 1px solid rgba(148,163,184,.12);
+    color: var(--muted); text-transform: uppercase; font-size: .76rem; letter-spacing: .12em;
+  }
+  .card-body { padding: 18px; }
+  .kpis { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+  .kpi { padding: 16px; border-radius: 14px; background: rgba(255,255,255,.03); border: 1px solid rgba(148,163,184,.12); }
+  .kpi-label { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .12em; }
+  .kpi-value { font-size: 1.5rem; margin-top: 10px; font-weight: 700; }
+  .config-list, .profile-list { display: grid; gap: 10px; }
+  .config-item, .profile-item {
+    display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px;
+    background: rgba(255,255,255,.03); border: 1px solid rgba(148,163,184,.1); border-radius: 12px;
+  }
+  .config-item strong, .profile-item strong { color: var(--muted); font-size: .8rem; }
+  .status-box {
+    padding: 12px 14px; border-radius: 12px; font-size: .84rem; line-height: 1.5;
+    border: 1px solid rgba(34,197,94,.28); background: rgba(34,197,94,.07); color: #bbf7d0;
+  }
+  .status-box.warn { border-color: rgba(245,158,11,.3); background: rgba(245,158,11,.08); color: #fde68a; }
+  .status-box.error { border-color: rgba(239,68,68,.35); background: rgba(239,68,68,.08); color: #fecaca; }
+  .media-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+  .media-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  .media-table td { padding: 8px; border-bottom: 1px solid rgba(255,255,255,.05); vertical-align: top; }
+  .tag { display:inline-block; padding: 3px 8px; border-radius: 999px; font-size: .68rem; border: 1px solid rgba(255,255,255,.1); }
+  .tag.image { color:#fdba74; background: rgba(249,115,22,.1); }
+  .tag.reel { color:#f9a8d4; background: rgba(236,72,153,.12); }
+  .tag.story { color:#93c5fd; background: rgba(59,130,246,.12); }
+  .muted { color: var(--muted); }
+  .mono { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: .78rem; word-break: break-all; }
+  .media-link { color: #fbcfe8; text-decoration: none; }
+  .media-link:hover { text-decoration: underline; }
+  @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Auto-Poster <span>Instagram Monitor</span></h1>
+  <div class="actions">
+    <button class="btn" onclick="window.location.href='/'">Hauptdashboard</button>
+    <button class="btn" onclick="window.location.href='/reels'">Reels</button>
+    <button class="btn" onclick="window.location.href='/music'">Musik</button>
+    <button class="btn" onclick="refreshInstagramMonitor(true)">Aktualisieren</button>
+  </div>
+</header>
+<main>
+  <div class="kpis" id="ig-kpis"></div>
+  <div class="grid">
+    <div class="card">
+      <div class="card-head">Account-Status</div>
+      <div class="card-body">
+        <div id="ig-status-box" class="status-box">Lädt…</div>
+        <div class="profile-list" id="ig-profile" style="margin-top:14px;">Lädt…</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head">Publishing-Konfiguration</div>
+      <div class="card-body">
+        <div class="config-list" id="ig-config">Lädt…</div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-head">Zuletzt ueber Instagram gepostete Medien</div>
+    <div class="card-body" id="ig-media-table">Lädt…</div>
+  </div>
+</main>
+<script>
+function esc(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function metricValue(value) {
+  return value === null || value === undefined || value === '' ? '–' : String(value);
+}
+
+async function refreshInstagramMonitor(force = false) {
+  const response = await fetch('/api/instagram/monitor' + (force ? '?refresh=1' : ''));
+  const data = await response.json();
+
+  document.getElementById('ig-kpis').innerHTML = `
+    <div class="kpi"><div class="kpi-label">Instagram aktiv</div><div class="kpi-value">${data.enabled ? 'Ja' : 'Nein'}</div></div>
+    <div class="kpi"><div class="kpi-label">Follower</div><div class="kpi-value">${metricValue((data.profile || {}).followers_count)}</div></div>
+    <div class="kpi"><div class="kpi-label">Media gesamt</div><div class="kpi-value">${metricValue((data.profile || {}).media_count)}</div></div>
+    <div class="kpi"><div class="kpi-label">Getrackte IG-Medien</div><div class="kpi-value">${metricValue((data.totals || {}).tracked_media)}</div></div>
+    <div class="kpi"><div class="kpi-label">Reels</div><div class="kpi-value">${metricValue((data.totals || {}).reels)}</div></div>
+    <div class="kpi"><div class="kpi-label">Storys</div><div class="kpi-value">${metricValue((data.totals || {}).stories)}</div></div>
+  `;
+
+  const profile = data.profile || {};
+  const statusBox = document.getElementById('ig-status-box');
+  const statusClass = !data.enabled ? 'status-box warn' : (profile.error ? 'status-box error' : 'status-box');
+  statusBox.className = statusClass;
+  statusBox.textContent = !data.enabled
+    ? 'Instagram-Posting ist derzeit deaktiviert.'
+    : (profile.error || 'Instagram-Verbindung aktiv und Monitor-Daten abrufbar.');
+
+  document.getElementById('ig-profile').innerHTML = `
+    <div class="profile-item"><strong>Username</strong><span>${esc(profile.username || data.username || '–')}</span></div>
+    <div class="profile-item"><strong>Business-ID</strong><span class="mono">${esc(profile.business_account_id || data.business_account_id || '–')}</span></div>
+    <div class="profile-item"><strong>Letztes Update</strong><span>${esc(data.last_updated ? new Date(data.last_updated).toLocaleString('de-DE') : '–')}</span></div>
+  `;
+
+  document.getElementById('ig-config').innerHTML = `
+    <div class="config-item"><strong>Bildposts</strong><span>${data.publish_posts ? 'Aktiv' : 'Aus'}</span></div>
+    <div class="config-item"><strong>Reels</strong><span>${data.publish_reels ? 'Aktiv' : 'Aus'}</span></div>
+    <div class="config-item"><strong>Storys</strong><span>${data.publish_stories ? 'Aktiv' : 'Aus'}</span></div>
+    <div class="config-item"><strong>Public Base URL</strong><span class="mono">${esc(data.public_base_url || '–')}</span></div>
+    <div class="config-item"><strong>Public Path</strong><span class="mono">${esc(data.public_path_prefix || '–')}</span></div>
+    <div class="config-item"><strong>Remote Staging</strong><span>${data.remote_staging_enabled ? 'Aktiv' : 'Aus'}</span></div>
+    <div class="config-item"><strong>Remote Target</strong><span class="mono">${esc(data.remote_target || '–')}</span></div>
+  `;
+
+  const mediaEl = document.getElementById('ig-media-table');
+  const media = Array.isArray(data.recent_media) ? data.recent_media : [];
+  if (!media.length) {
+    mediaEl.innerHTML = '<div class="muted">Noch keine ueber Instagram geposteten Medien im State gefunden.</div>';
+    return;
+  }
+
+  mediaEl.innerHTML = `<table class="media-table">
+    <thead>
+      <tr><th>Typ</th><th>Datei</th><th>Zeit</th><th>Metriken</th><th>Link</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      ${media.map(item => {
+        const tagClass = item.content_type === 'reel' ? 'reel' : item.content_type === 'story' ? 'story' : 'image';
+        const insights = item.insights || {};
+        const metricParts = [
+          `Likes ${metricValue(item.like_count)}`,
+          `Kommentare ${metricValue(item.comments_count)}`,
+          `Reach ${metricValue(insights.reach)}`,
+          item.content_type === 'reel' ? `Plays ${metricValue(insights.plays)}` : `Impressions ${metricValue(insights.impressions)}`,
+          `Saved ${metricValue(insights.saved)}`,
+        ];
+        const link = item.permalink ? `<a class="media-link" href="${esc(item.permalink)}" target="_blank" rel="noopener">Oeffnen</a>` : '–';
+        const status = item.error ? esc(item.error) : esc(item.platform_message || 'OK');
+        return `<tr>
+          <td><span class="tag ${tagClass}">${esc(item.content_type || 'media')}</span></td>
+          <td>${esc(item.file || '–')}<div class="muted">Slot ${esc(item.slot || '–')}</div></td>
+          <td>${esc(item.time ? new Date(item.time).toLocaleString('de-DE') : '–')}</td>
+          <td>${metricParts.map(part => `<div>${esc(part)}</div>`).join('')}</td>
+          <td>${link}</td>
+          <td>${status}</td>
+        </tr>`;
+      }).join('')}
+    </tbody>
+  </table>`;
+}
+
+refreshInstagramMonitor();
+setInterval(() => refreshInstagramMonitor(false), 30000);
+</script>
+</body>
+</html>
+"""
+
 
 @app.route("/")
 def index():
@@ -3195,6 +4796,11 @@ def reels_index():
   return render_template_string(REELS_HTML)
 
 
+@app.route("/instagram")
+def instagram_index():
+  return render_template_string(INSTAGRAM_HTML)
+
+
 @app.route("/music")
 def music_index():
   return render_template_string(MUSIC_HTML)
@@ -3204,8 +4810,10 @@ def music_index():
 # Start
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    print("=" * 55)
-    print("  Dashboard läuft → http://localhost:5000")
-    print("  Strg+C zum Beenden")
-    print("=" * 55)
-    app.run(host="127.0.0.1", port=5000, debug=False)
+  host = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+  port = int(os.getenv("DASHBOARD_PORT", "5000"))
+  print("=" * 55)
+  print(f"  Dashboard läuft → http://{host}:{port}")
+  print("  Strg+C zum Beenden")
+  print("=" * 55)
+  app.run(host=host, port=port, debug=False)

@@ -10,6 +10,9 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from auto_comment_texts import DEFAULT_AUTO_COMMENT_TEMPLATES
+from story_texts import DEFAULT_STORY_TEXTS
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 STATE_FILE = BASE_DIR / "state.json"
@@ -22,20 +25,22 @@ DEFAULT_AI_DISCLOSURE = "Dieses Bild wurde mit KI erstellt.\nÄhnlichkeiten mit 
 DEFAULT_SYSTEM_PROMPT = (
     "Du schreibst virale Social-Media-Captions für Facebook und Instagram. "
     "Schreibe auf Deutsch, emotional, direkt und aufmerksamkeitsstark. "
-    "Die erste Zeile braucht einen starken Hook. Verwende 2 bis 4 kurze Sätze, "
-    "spreche die Leser direkt mit du an, nutze gelegentlich Emojis wie 👀 oder 🔥 "
-    "und ende mit einer Frage. Die letzte Zeile muss exakt der KI-Hinweis sein."
+    "Die erste Zeile braucht einen starken Scroll-Stopper-Hook. Verwende 2 bis 4 kurze Sätze, "
+    "spreche die Leser direkt mit du an, baue Vergleich, Bewertung oder Neugier ein, "
+    "nutze gelegentlich Emojis wie 👀 oder 🔥 und ende mit einer klaren Frage oder CTA, "
+    "die Kommentare, Saves oder Shares auslöst. Die letzte Zeile muss exakt der KI-Hinweis sein."
 )
 DEFAULT_USER_PROMPT = (
     "Erstelle {variant_count} verschiedene Caption-Varianten für ein KI-generiertes Bild.\n"
     "Anforderungen:\n"
     "- Deutsch\n"
     "- 2 bis 4 kurze Sätze\n"
-    "- Erste Zeile mit starkem Hook\n"
-    "- Am Ende eine klare Frage\n"
+    "- Erste Zeile mit starkem Hook, ideal für Scroll-Stop\n"
+    "- Am Ende eine klare Frage oder CTA\n"
     "- Einfache direkte Sprache\n"
     "- Gelegentlich Emojis\n"
-    "- Fokus auf Kommentare, Likes und Shares\n"
+    "- Fokus auf Kommentare, Saves, Shares und Follows\n"
+    "- Bevorzuge Formulierungen wie Vergleiche, Entscheidungen, Bewertung oder Neugier\n"
     "- Letzte Zeile exakt: {disclaimer}\n\n"
     "Bildname: {filename}\n"
     "Bildbeschreibung: {description}\n\n"
@@ -45,8 +50,9 @@ DEFAULT_REEL_SYSTEM_PROMPT = (
     "Du schreibst virale Kurz-Captions für Social-Media-Reels auf Deutsch. "
     "Der Text muss schneller, direkter und hook-lastiger sein als bei normalen Bildposts. "
     "Die erste Zeile muss sofort Aufmerksamkeit ziehen. Verwende 2 bis 3 kurze Sätze, "
-    "sprich die Leser direkt mit du an, nutze gelegentlich Emojis wie 👀, 🔥 oder ✨ "
-    "und ende mit einer klaren Frage oder Call-to-Action. Die letzte Zeile muss exakt der KI-Hinweis sein."
+    "sprich die Leser direkt mit du an, nutze gelegentlich Emojis wie 👀, 🔥 oder ✨, "
+    "arbeite mit Vergleich, Auswahl oder Bewertung und ende mit einer klaren Frage oder Call-to-Action, "
+    "die Kommentare, Saves oder Shares auslöst. Die letzte Zeile muss exakt der KI-Hinweis sein."
 )
 DEFAULT_REEL_USER_PROMPT = (
     "Erstelle {variant_count} verschiedene Caption-Varianten für ein kurzes Multi-Image-Reel.\n"
@@ -55,7 +61,8 @@ DEFAULT_REEL_USER_PROMPT = (
     "- 2 bis 3 kurze Sätze\n"
     "- Erste Zeile mit starkem Reel-Hook\n"
     "- Schneller, dynamischer Stil\n"
-    "- Fokus auf Kommentare, Shares und Speichern\n"
+    "- Fokus auf Kommentare, Shares, Speichern und Follows\n"
+    "- Verwende möglichst Auswahl-, Vergleichs- oder Bewertungsfragen\n"
     "- Am Ende eine klare Frage oder ein kurzer Call-to-Action\n"
     "- Letzte Zeile exakt: {disclaimer}\n\n"
     "Reel-Name: {filename}\n"
@@ -68,6 +75,35 @@ DEFAULT_REEL_USER_PROMPT = (
 class FacebookSettings:
     page_id: str
     access_token: str
+
+
+@dataclass(slots=True)
+class InstagramSettings:
+    enabled: bool
+    business_account_id: str
+    access_token: str
+    username: str
+    publish_posts: bool
+    publish_reels: bool
+    publish_stories: bool
+    public_base_url: str
+    public_path_prefix: str
+    staging_folder: Path
+    remote_staging_enabled: bool
+    remote_host: str
+    remote_user: str
+    remote_path: str
+    remote_upload_method: str
+    remote_ssh_port: int
+    external_url_fallback_enabled: bool
+    external_url_fallback_provider: str
+    external_url_fallback_expiry: str
+    keep_files: int
+    auto_cleanup_enabled: bool
+    cleanup_ttl_seconds: int
+    share_reels_to_feed: bool
+    container_check_interval_seconds: float
+    container_check_timeout_seconds: int
 
 
 @dataclass(slots=True)
@@ -124,6 +160,20 @@ class ReelSettings:
 
 
 @dataclass(slots=True)
+class StorySettings:
+    enabled: bool
+    publish_to_facebook: bool
+    output_folder: Path
+    width: int
+    height: int
+    max_per_day: int
+    chance_per_slot: float
+    eligible_slots: list[str]
+    brand_footer: str
+    texts: dict[str, list[str]]
+
+
+@dataclass(slots=True)
 class MusicLibrarySettings:
     enabled: bool
     folder: Path
@@ -176,6 +226,14 @@ class EngagementTrackingSettings:
     delay_hours: int
     low_engagement_threshold: int
     low_engagement_last_n: int
+    high_engagement_threshold: int
+    recycle_low_performers: bool
+    recycle_after_hours: int
+    recycle_formats: list[str]
+    followup_comments_enabled: bool
+    low_followup_templates: list[str]
+    high_followup_templates: list[str]
+    unusual_spike_multiplier: float
 
 
 @dataclass(slots=True)
@@ -184,6 +242,7 @@ class SmartSlotsSettings:
     top_slots_count: int
     prefer_historical: bool
     min_data_points: int
+    exploration_rate: float
 
 
 @dataclass(slots=True)
@@ -193,6 +252,13 @@ class AutoCommentSettings:
     templates: list[str]
     retroactive: bool
     retroactive_max_age_days: int
+    ollama_enabled: bool
+    ollama_ratio: float
+    ollama_cache_size: int
+    style_profile: str
+    feed_style: str
+    reel_style: str
+    repeat_block_count: int
 
 
 @dataclass(slots=True)
@@ -205,6 +271,49 @@ class CaptionScoringSettings:
 @dataclass(slots=True)
 class FollowerTrackingSettings:
     enabled: bool
+
+
+@dataclass(slots=True)
+class CampaignDefinition:
+    name: str
+    themes: list[str]
+    start_date: str
+    end_date: str
+    days_per_theme: int
+    preferred_slots: list[str]
+    target_feed_posts: int
+    target_stories: int
+    target_reels: int
+
+
+@dataclass(slots=True)
+class CampaignSettings:
+    enabled: bool
+    auto_rotate: bool
+    active_campaign_name: str
+    fallback_to_detected_themes: bool
+    theme_separator: str
+    default_days_per_theme: int
+    weekday_modes: dict[str, str]
+    daily_theme_overrides: dict[str, str]
+    campaigns: list[CampaignDefinition]
+
+
+@dataclass(slots=True)
+class CaptionExperimentSettings:
+    enabled: bool
+    exploration_rate: float
+    min_data_points: int
+
+
+@dataclass(slots=True)
+class ContentQualitySettings:
+    enabled: bool
+    min_score: int
+    skip_similar_images: bool
+    duplicate_hamming_threshold: int
+    theme_whitelist: list[str]
+    theme_blacklist: list[str]
 
 
 @dataclass(slots=True)
@@ -238,9 +347,11 @@ class AppConfig:
     caption_variant_count: int
     caption_selection_strategy: str
     facebook: FacebookSettings
+    instagram: InstagramSettings
     ollama: OllamaSettings
     openai: OpenAISettings
     reels: ReelSettings
+    stories: StorySettings
     music_library: MusicLibrarySettings
     watermark: WatermarkSettings
     retry: RetrySettings
@@ -250,18 +361,22 @@ class AppConfig:
     smart_slots: SmartSlotsSettings
     auto_comment: AutoCommentSettings
     caption_scoring: CaptionScoringSettings
+    campaigns: CampaignSettings
+    caption_experiments: CaptionExperimentSettings
+    content_quality: ContentQualitySettings
     follower_tracking: FollowerTrackingSettings
     comment_response: CommentResponseSettings
 
 
 def load_settings() -> AppConfig:
-    load_dotenv(BASE_DIR / ".env")
     raw = _load_json(CONFIG_FILE)
 
     facebook_raw = raw.get("facebook", {})
+    instagram_raw = raw.get("instagram", {})
     ollama_raw = raw.get("ollama", {})
     openai_raw = raw.get("openai", {})
     reels_raw = raw.get("reels", {})
+    stories_raw = raw.get("stories", {})
     music_raw = raw.get("music_library", {})
     watermark_raw = raw.get("watermark", {})
     retry_raw = raw.get("retry", {})
@@ -271,6 +386,9 @@ def load_settings() -> AppConfig:
     smart_slots_raw = raw.get("smart_slots", {})
     auto_comment_raw = raw.get("auto_comment", {})
     caption_scoring_raw = raw.get("caption_scoring", {})
+    campaigns_raw = raw.get("campaigns", {})
+    caption_experiments_raw = raw.get("caption_experiments", {})
+    content_quality_raw = raw.get("content_quality", {})
     follower_tracking_raw = raw.get("follower_tracking", {})
     comment_response_raw = raw.get("comment_response", {})
 
@@ -286,6 +404,44 @@ def load_settings() -> AppConfig:
     user_prompt_template = openai_raw.get("user_prompt_template") or os.getenv("OPENAI_USER_PROMPT_TEMPLATE") or DEFAULT_USER_PROMPT
     reel_system_prompt = openai_raw.get("reel_system_prompt") or os.getenv("OPENAI_REEL_SYSTEM_PROMPT") or DEFAULT_REEL_SYSTEM_PROMPT
     reel_user_prompt_template = openai_raw.get("reel_user_prompt_template") or os.getenv("OPENAI_REEL_USER_PROMPT_TEMPLATE") or DEFAULT_REEL_USER_PROMPT
+    story_slots = _read_list_env("STORIES_SLOTS") or stories_raw.get("eligible_slots") or ["08:00", "21:00"]
+    story_slots = [_normalize_slot(slot) for slot in story_slots]
+    story_texts_raw = stories_raw.get("texts") or {}
+    story_texts = {
+        theme: [str(item).strip() for item in story_texts_raw.get(theme, DEFAULT_STORY_TEXTS.get(theme, [])) if str(item).strip()]
+        for theme in sorted(set(DEFAULT_STORY_TEXTS) | set(story_texts_raw))
+    }
+    campaign_definitions: list[CampaignDefinition] = []
+    for item in campaigns_raw.get("campaigns", []) or []:
+        if not isinstance(item, dict):
+            continue
+        themes = [str(theme).strip() for theme in item.get("themes", []) if str(theme).strip()]
+        preferred_slots = [_normalize_slot(slot) for slot in item.get("preferred_slots", []) if str(slot).strip()]
+        campaign_definitions.append(
+            CampaignDefinition(
+                name=str(item.get("name") or "").strip(),
+                themes=themes,
+                start_date=str(item.get("start_date") or "").strip(),
+                end_date=str(item.get("end_date") or "").strip(),
+                days_per_theme=max(1, int(item.get("days_per_theme", campaigns_raw.get("default_days_per_theme", 2)) or 2)),
+                preferred_slots=preferred_slots,
+                target_feed_posts=max(0, int(item.get("target_feed_posts", 3) or 0)),
+                target_stories=max(0, int(item.get("target_stories", 2) or 0)),
+                target_reels=max(0, int(item.get("target_reels", 1) or 0)),
+            )
+        )
+    weekday_modes_raw = campaigns_raw.get("weekday_modes") or {}
+    weekday_modes = {
+        str(day).strip().lower(): (str(mode).strip().lower() or "theme")
+        for day, mode in weekday_modes_raw.items()
+        if str(day).strip()
+    }
+    daily_theme_overrides_raw = campaigns_raw.get("daily_theme_overrides") or {}
+    daily_theme_overrides = {
+        str(day).strip(): str(theme).strip().lower()
+        for day, theme in daily_theme_overrides_raw.items()
+        if str(day).strip() and str(theme).strip()
+    }
 
     return AppConfig(
         platform=_env_or_config("PLATFORM", raw, "platform", default="facebook"),
@@ -315,6 +471,33 @@ def load_settings() -> AppConfig:
         facebook=FacebookSettings(
             page_id=os.getenv("FB_PAGE_ID") or facebook_raw.get("page_id", ""),
             access_token=os.getenv("FB_PAGE_ACCESS_TOKEN") or facebook_raw.get("access_token", ""),
+        ),
+        instagram=InstagramSettings(
+            enabled=_read_bool_env("INSTAGRAM_ENABLED", instagram_raw.get("enabled", False)),
+            business_account_id=os.getenv("IG_BUSINESS_ACCOUNT_ID") or instagram_raw.get("business_account_id", ""),
+            access_token=os.getenv("IG_ACCESS_TOKEN") or instagram_raw.get("access_token", "") or (os.getenv("FB_PAGE_ACCESS_TOKEN") or facebook_raw.get("access_token", "")),
+            username=os.getenv("IG_USERNAME") or instagram_raw.get("username", ""),
+            publish_posts=_read_bool_env("INSTAGRAM_PUBLISH_POSTS", instagram_raw.get("publish_posts", False)),
+            publish_reels=_read_bool_env("INSTAGRAM_PUBLISH_REELS", instagram_raw.get("publish_reels", False)),
+            publish_stories=_read_bool_env("INSTAGRAM_PUBLISH_STORIES", instagram_raw.get("publish_stories", False)),
+            public_base_url=(os.getenv("INSTAGRAM_PUBLIC_BASE_URL") or instagram_raw.get("public_base_url", "")).rstrip("/"),
+            public_path_prefix="/" + str(os.getenv("INSTAGRAM_PUBLIC_PATH_PREFIX") or instagram_raw.get("public_path_prefix", "/public-media")).strip().strip("/"),
+            staging_folder=Path(os.getenv("INSTAGRAM_STAGING_FOLDER") or instagram_raw.get("staging_folder", str(BASE_DIR / "public_media" / "instagram"))),
+            remote_staging_enabled=_read_bool_env("INSTAGRAM_REMOTE_STAGING_ENABLED", instagram_raw.get("remote_staging_enabled", False)),
+            remote_host=os.getenv("INSTAGRAM_REMOTE_HOST") or instagram_raw.get("remote_host", ""),
+            remote_user=os.getenv("INSTAGRAM_REMOTE_USER") or instagram_raw.get("remote_user", ""),
+            remote_path=os.getenv("INSTAGRAM_REMOTE_PATH") or instagram_raw.get("remote_path", ""),
+            remote_upload_method=(os.getenv("INSTAGRAM_REMOTE_UPLOAD_METHOD") or instagram_raw.get("remote_upload_method", "scp")).strip().lower(),
+            remote_ssh_port=int(os.getenv("INSTAGRAM_REMOTE_SSH_PORT") or instagram_raw.get("remote_ssh_port", 22)),
+            external_url_fallback_enabled=_read_bool_env("INSTAGRAM_EXTERNAL_URL_FALLBACK_ENABLED", instagram_raw.get("external_url_fallback_enabled", False)),
+            external_url_fallback_provider=(os.getenv("INSTAGRAM_EXTERNAL_URL_FALLBACK_PROVIDER") or instagram_raw.get("external_url_fallback_provider", "litterbox")).strip().lower(),
+            external_url_fallback_expiry=(os.getenv("INSTAGRAM_EXTERNAL_URL_FALLBACK_EXPIRY") or instagram_raw.get("external_url_fallback_expiry", "72h")).strip() or "72h",
+            keep_files=int(os.getenv("INSTAGRAM_KEEP_FILES") or instagram_raw.get("keep_files", 80)),
+            auto_cleanup_enabled=_read_bool_env("INSTAGRAM_AUTO_CLEANUP", instagram_raw.get("auto_cleanup_enabled", True)),
+            cleanup_ttl_seconds=int(os.getenv("INSTAGRAM_CLEANUP_TTL_SECONDS") or instagram_raw.get("cleanup_ttl_seconds", 1800)),
+            share_reels_to_feed=_read_bool_env("INSTAGRAM_SHARE_REELS_TO_FEED", instagram_raw.get("share_reels_to_feed", True)),
+            container_check_interval_seconds=float(os.getenv("INSTAGRAM_CONTAINER_CHECK_INTERVAL") or instagram_raw.get("container_check_interval_seconds", 5.0)),
+            container_check_timeout_seconds=int(os.getenv("INSTAGRAM_CONTAINER_CHECK_TIMEOUT") or instagram_raw.get("container_check_timeout_seconds", 300)),
         ),
         ollama=OllamaSettings(
             enabled=_read_bool_env("OLLAMA_ENABLED", ollama_raw.get("enabled", True)),
@@ -362,6 +545,18 @@ def load_settings() -> AppConfig:
             call_to_action=os.getenv("REELS_CALL_TO_ACTION") or reels_raw.get("call_to_action", "Folgen, speichern, kommentieren"),
             anchor_cooldown_reels=int(os.getenv("REELS_ANCHOR_COOLDOWN_REELS") or reels_raw.get("anchor_cooldown_reels", 3)),
             duplicate_window_reels=int(os.getenv("REELS_DUPLICATE_WINDOW_REELS") or reels_raw.get("duplicate_window_reels", 12)),
+        ),
+        stories=StorySettings(
+            enabled=_read_bool_env("STORIES_ENABLED", stories_raw.get("enabled", False)),
+            publish_to_facebook=_read_bool_env("STORIES_PUBLISH_TO_FACEBOOK", stories_raw.get("publish_to_facebook", True)),
+            output_folder=Path(os.getenv("STORIES_OUTPUT_FOLDER") or stories_raw.get("output_folder", str(BASE_DIR / "generated_stories"))),
+            width=int(os.getenv("STORIES_WIDTH") or stories_raw.get("width", 1080)),
+            height=int(os.getenv("STORIES_HEIGHT") or stories_raw.get("height", 1920)),
+            max_per_day=int(os.getenv("STORIES_MAX_PER_DAY") or stories_raw.get("max_per_day", 1)),
+            chance_per_slot=float(os.getenv("STORIES_CHANCE_PER_SLOT") or stories_raw.get("chance_per_slot", 0.45)),
+            eligible_slots=story_slots,
+            brand_footer=os.getenv("STORIES_BRAND_FOOTER") or stories_raw.get("brand_footer", ""),
+            texts=story_texts,
         ),
         music_library=MusicLibrarySettings(
             enabled=_read_bool_env("MUSIC_LIBRARY_ENABLED", music_raw.get("enabled", True)),
@@ -412,28 +607,76 @@ def load_settings() -> AppConfig:
             delay_hours=int(os.getenv("ENGAGEMENT_DELAY_HOURS") or engagement_raw.get("delay_hours", 24)),
             low_engagement_threshold=int(os.getenv("ENGAGEMENT_LOW_THRESHOLD") or engagement_raw.get("low_engagement_threshold", 5)),
             low_engagement_last_n=int(os.getenv("ENGAGEMENT_LOW_LAST_N") or engagement_raw.get("low_engagement_last_n", 5)),
+            high_engagement_threshold=int(os.getenv("ENGAGEMENT_HIGH_THRESHOLD") or engagement_raw.get("high_engagement_threshold", 45)),
+            recycle_low_performers=_read_bool_env("ENGAGEMENT_RECYCLE_LOW", engagement_raw.get("recycle_low_performers", True)),
+            recycle_after_hours=int(os.getenv("ENGAGEMENT_RECYCLE_AFTER_HOURS") or engagement_raw.get("recycle_after_hours", 30)),
+            recycle_formats=_read_list_env("ENGAGEMENT_RECYCLE_FORMATS") or [
+                str(item).lower() for item in engagement_raw.get("recycle_formats", ["story", "reel"])
+            ],
+            followup_comments_enabled=_read_bool_env("ENGAGEMENT_FOLLOWUP_COMMENTS", engagement_raw.get("followup_comments_enabled", True)),
+            low_followup_templates=_read_list_env("ENGAGEMENT_LOW_FOLLOWUP_TEMPLATES") or [
+                str(item).strip() for item in engagement_raw.get("low_followup_templates", []) if str(item).strip()
+            ],
+            high_followup_templates=_read_list_env("ENGAGEMENT_HIGH_FOLLOWUP_TEMPLATES") or [
+                str(item).strip() for item in engagement_raw.get("high_followup_templates", []) if str(item).strip()
+            ],
+            unusual_spike_multiplier=float(os.getenv("ENGAGEMENT_UNUSUAL_SPIKE_MULTIPLIER") or engagement_raw.get("unusual_spike_multiplier", 1.8)),
         ),
         smart_slots=SmartSlotsSettings(
             enabled=_read_bool_env("SMART_SLOTS_ENABLED", smart_slots_raw.get("enabled", False)),
             top_slots_count=int(os.getenv("SMART_SLOTS_TOP_COUNT") or smart_slots_raw.get("top_slots_count", 4)),
             prefer_historical=_read_bool_env("SMART_SLOTS_PREFER_HISTORICAL", smart_slots_raw.get("prefer_historical", True)),
             min_data_points=int(os.getenv("SMART_SLOTS_MIN_DATA_POINTS") or smart_slots_raw.get("min_data_points", 20)),
+            exploration_rate=float(os.getenv("SMART_SLOTS_EXPLORATION_RATE") or smart_slots_raw.get("exploration_rate", 0.15)),
         ),
         auto_comment=AutoCommentSettings(
             enabled=_read_bool_env("AUTO_COMMENT_ENABLED", auto_comment_raw.get("enabled", False)),
             delay_seconds=int(os.getenv("AUTO_COMMENT_DELAY_SECONDS") or auto_comment_raw.get("delay_seconds", 60)),
-            templates=_read_list_env("AUTO_COMMENT_TEMPLATES") or [str(t) for t in auto_comment_raw.get("templates", [
-                "Was denkst du? Folge uns für mehr KI-Kunst! 👀",
-                "Echt oder KI? Schreib es uns in die Kommentare! 🔥",
-                "Welches Detail fällt dir als erstes auf? ✨",
-            ])],
+            templates=_read_list_env("AUTO_COMMENT_TEMPLATES") or [
+                str(t) for t in (auto_comment_raw.get("templates") or DEFAULT_AUTO_COMMENT_TEMPLATES)
+            ],
             retroactive=_read_bool_env("AUTO_COMMENT_RETROACTIVE", auto_comment_raw.get("retroactive", False)),
             retroactive_max_age_days=int(os.getenv("AUTO_COMMENT_RETROACTIVE_MAX_AGE_DAYS") or auto_comment_raw.get("retroactive_max_age_days", 30)),
+            ollama_enabled=_read_bool_env("AUTO_COMMENT_OLLAMA_ENABLED", auto_comment_raw.get("ollama_enabled", True)),
+            ollama_ratio=float(os.getenv("AUTO_COMMENT_OLLAMA_RATIO") or auto_comment_raw.get("ollama_ratio", 0.25)),
+            ollama_cache_size=int(os.getenv("AUTO_COMMENT_OLLAMA_CACHE_SIZE") or auto_comment_raw.get("ollama_cache_size", 24)),
+            style_profile=(os.getenv("AUTO_COMMENT_STYLE_PROFILE") or auto_comment_raw.get("style_profile", "frech")).lower(),
+            feed_style=(os.getenv("AUTO_COMMENT_FEED_STYLE") or auto_comment_raw.get("feed_style", "charmant")).lower(),
+            reel_style=(os.getenv("AUTO_COMMENT_REEL_STYLE") or auto_comment_raw.get("reel_style", "direkt")).lower(),
+            repeat_block_count=int(os.getenv("AUTO_COMMENT_REPEAT_BLOCK_COUNT") or auto_comment_raw.get("repeat_block_count", 80)),
         ),
         caption_scoring=CaptionScoringSettings(
             enabled=_read_bool_env("CAPTION_SCORING_ENABLED", caption_scoring_raw.get("enabled", True)),
             min_score=int(os.getenv("CAPTION_SCORING_MIN_SCORE") or caption_scoring_raw.get("min_score", 55)),
             max_retries=int(os.getenv("CAPTION_SCORING_MAX_RETRIES") or caption_scoring_raw.get("max_retries", 2)),
+        ),
+        campaigns=CampaignSettings(
+            enabled=_read_bool_env("CAMPAIGNS_ENABLED", campaigns_raw.get("enabled", False)),
+            auto_rotate=_read_bool_env("CAMPAIGNS_AUTO_ROTATE", campaigns_raw.get("auto_rotate", True)),
+            active_campaign_name=(os.getenv("CAMPAIGNS_ACTIVE_NAME") or campaigns_raw.get("active_campaign_name", "")).strip(),
+            fallback_to_detected_themes=_read_bool_env("CAMPAIGNS_FALLBACK_THEMES", campaigns_raw.get("fallback_to_detected_themes", True)),
+            theme_separator=str(os.getenv("CAMPAIGNS_THEME_SEPARATOR") or campaigns_raw.get("theme_separator", "_") or "_"),
+            default_days_per_theme=max(1, int(os.getenv("CAMPAIGNS_DEFAULT_DAYS_PER_THEME") or campaigns_raw.get("default_days_per_theme", 2))),
+            weekday_modes=weekday_modes,
+            daily_theme_overrides=daily_theme_overrides,
+            campaigns=campaign_definitions,
+        ),
+        caption_experiments=CaptionExperimentSettings(
+            enabled=_read_bool_env("CAPTION_EXPERIMENTS_ENABLED", caption_experiments_raw.get("enabled", False)),
+            exploration_rate=float(os.getenv("CAPTION_EXPERIMENTS_EXPLORATION_RATE") or caption_experiments_raw.get("exploration_rate", 0.2)),
+            min_data_points=int(os.getenv("CAPTION_EXPERIMENTS_MIN_DATA_POINTS") or caption_experiments_raw.get("min_data_points", 4)),
+        ),
+        content_quality=ContentQualitySettings(
+            enabled=_read_bool_env("CONTENT_QUALITY_ENABLED", content_quality_raw.get("enabled", True)),
+            min_score=int(os.getenv("CONTENT_QUALITY_MIN_SCORE") or content_quality_raw.get("min_score", 55)),
+            skip_similar_images=_read_bool_env("CONTENT_QUALITY_SKIP_SIMILAR", content_quality_raw.get("skip_similar_images", True)),
+            duplicate_hamming_threshold=int(os.getenv("CONTENT_QUALITY_DUPLICATE_HAMMING") or content_quality_raw.get("duplicate_hamming_threshold", 6)),
+            theme_whitelist=_read_list_env("CONTENT_THEME_WHITELIST") or [
+                str(item).strip().lower() for item in content_quality_raw.get("theme_whitelist", []) if str(item).strip()
+            ],
+            theme_blacklist=_read_list_env("CONTENT_THEME_BLACKLIST") or [
+                str(item).strip().lower() for item in content_quality_raw.get("theme_blacklist", []) if str(item).strip()
+            ],
         ),
         follower_tracking=FollowerTrackingSettings(
             enabled=_read_bool_env("FOLLOWER_TRACKING_ENABLED", follower_tracking_raw.get("enabled", False)),
@@ -445,8 +688,8 @@ def load_settings() -> AppConfig:
             lookback_days=int(os.getenv("COMMENT_RESPONSE_LOOKBACK_DAYS") or comment_response_raw.get("lookback_days", 3)),
             templates=_read_list_env("COMMENT_RESPONSE_TEMPLATES") or [str(t) for t in comment_response_raw.get("templates", [
                 "Danke! 🙏 Was ist dein Lieblingsdetail?",
-                "Schön dass du fragst! Folge uns für mehr 👀",
-                "Freut uns sehr! Was gefällt dir am besten? ✨",
+                "Schön, dass du fragst! Wenn du magst, bleib gern hier 👀",
+                "Freut mich sehr! Was gefällt dir am besten? ✨",
             ])],
         ),
     )
